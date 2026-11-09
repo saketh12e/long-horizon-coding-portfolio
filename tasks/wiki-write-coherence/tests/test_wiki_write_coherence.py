@@ -1,0 +1,341 @@
+"""Behavioral regression tests for coherent wiki writes and page identity."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from memory_service.core import MemoryService
+from memory_service.wiki_engine import LivingWikiEngine
+
+
+def _engine(tmp_path: Path) -> LivingWikiEngine:
+    memory_service = MemoryService(
+        backend="memory",
+        sanitize=False,
+        cache_path=str(tmp_path / "embedding-cache.db"),
+        analytics_path=str(tmp_path / "analytics.db"),
+    )
+    return LivingWikiEngine(memory_service, wiki_dir=str(tmp_path / "wiki"))
+
+
+def _auto_wiki(tmp_path: Path) -> tuple[MemoryService, LivingWikiEngine]:
+    memory_service = MemoryService(
+        backend="memory",
+        sanitize=False,
+        cache_path=str(tmp_path / "embedding-cache.db"),
+        analytics_path=str(tmp_path / "analytics.db"),
+    )
+    memory_service.enable_compounding_ingest(wiki_dir=str(tmp_path / "wiki"))
+    engine = memory_service.living_wiki
+    assert isinstance(engine, LivingWikiEngine)
+    return memory_service, engine
+
+
+def _entities(engine: LivingWikiEngine) -> list[str]:
+    return [page.entity for page in engine.list_pages()]
+
+
+def _page_by_entity(engine: LivingWikiEngine) -> dict[str, object]:
+    return {page.entity: page for page in engine.list_pages()}
+
+
+class TestLivingWikiWriteVisibility:
+    def test_manual_page_created_after_list_cache_is_visible(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.list_pages() == []
+
+        result = engine.create_page("Delta Page", entity_type="concept", content="Delta body")
+
+        assert result["status"] == "created"
+        assert "Delta Page" in _entities(engine)
+
+    def test_second_manual_page_does_not_wait_for_cache_window(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        first = engine.create_page("Alpha Page", entity_type="concept", content="Alpha body")
+        assert first["status"] == "created"
+        cached = engine.list_pages()
+        assert [page.entity for page in cached] == ["Alpha Page"]
+
+        second = engine.create_page("Beta Page", entity_type="concept", content="Beta body")
+
+        assert second["status"] == "created"
+        assert _entities(engine) == ["Alpha Page", "Beta Page"]
+
+    def test_force_update_refreshes_previously_empty_page_list(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.list_pages() == []
+        engine._memory_service.learn("A launch note mentions an engineer", tags=["atlas-topic"])
+
+        result = engine.update(force=True)
+
+        assert result.pages_created >= 1
+        entities = _entities(engine)
+        assert "atlas-topic" in entities
+        assert "Project Atlas" in entities or "Morgan" in entities
+
+    def test_update_for_item_refreshes_cached_page_list_for_new_tag_entity(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.list_pages() == []
+        item = engine._memory_service.learn("Routine note for the living wiki", tags=["coherence-topic"])
+
+        result = engine.update_for_item(item)
+
+        assert result.pages_created >= 1
+        assert "coherence-topic" in _entities(engine)
+
+    def test_incremental_update_refreshes_cached_backlinks(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.create_page("alpha-topic", entity_type="topic")["status"] == "created"
+        assert engine.create_page("beta-topic", entity_type="topic")["status"] == "created"
+        before = _page_by_entity(engine)
+        assert before["alpha-topic"].backlinks == []
+        assert before["beta-topic"].backlinks == []
+        item = engine._memory_service.learn("Alpha and beta are tracked together", tags=["alpha-topic", "beta-topic"])
+
+        engine.update_for_item(item)
+
+        after = _page_by_entity(engine)
+        assert "beta-topic" in after["alpha-topic"].backlinks
+        assert "alpha-topic" in after["beta-topic"].backlinks
+
+
+class TestLivingWikiSlugCoherence:
+    _EXISTS_STATUSES = {"already_exists", "slug_conflict"}
+
+    def test_slug_collision_does_not_overwrite_existing_page(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        first = engine.create_page("Foo Bar", entity_type="concept", content="first page body")
+        first_body = engine.read_page("Foo Bar")
+
+        second = engine.create_page("Foo-Bar", entity_type="concept", content="second page body")
+        after_body = engine.read_page("Foo Bar")
+
+        assert first["status"] == "created"
+        assert second["status"] in self._EXISTS_STATUSES
+        assert first_body is not None
+        assert after_body == first_body
+        assert "second page body" not in after_body
+
+    def test_slug_collision_is_not_listed_as_second_entity(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        engine.create_page("Foo Bar", entity_type="concept", content="first page body")
+
+        duplicate = engine.create_page("Foo-Bar", entity_type="concept", content="second page body")
+
+        assert duplicate["status"] in self._EXISTS_STATUSES
+        entities = _entities(engine)
+        assert entities.count("Foo Bar") == 1
+        assert "Foo-Bar" not in entities
+
+    def test_existing_orphan_markdown_file_is_not_overwritten(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        init = engine.init()
+        pages_dir = Path(init["pages_dir"])
+        page_path = pages_dir / "orphan-page.md"
+        page_path.write_text("# Orphan Page\n\nHand-maintained note.\n", encoding="utf-8")
+
+        result = engine.create_page("Orphan Page", entity_type="concept", content="generated body")
+
+        assert result["status"] in self._EXISTS_STATUSES
+        body = page_path.read_text(encoding="utf-8")
+        assert "Hand-maintained note." in body
+        assert "generated body" not in body
+
+    def test_slug_collision_preserves_searchable_original_title(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        engine.create_page("Foo Bar", entity_type="concept", content="original searchable phrase")
+
+        engine.create_page("Foo-Bar", entity_type="concept", content="replacement searchable phrase")
+
+        results = engine.search("original searchable phrase")
+        assert any(result["entity"] == "Foo Bar" for result in results)
+        assert not any(result["entity"] == "Foo-Bar" for result in results)
+
+    def test_incremental_update_does_not_create_shadow_entity_for_existing_page_path(
+        self, tmp_path: Path
+    ) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.create_page("Gamma Node", entity_type="topic", content="manual anchor")[
+            "status"
+        ] == "created"
+        assert "Gamma Node" in _page_by_entity(engine)
+        item = engine._memory_service.learn("routine note for collision handling", tags=["Gamma-Node"])
+
+        engine.update_for_item(item)
+
+        pages = _page_by_entity(engine)
+        assert "Gamma Node" in pages
+        assert "Gamma-Node" not in pages
+        assert pages["Gamma Node"].memory_count == 1
+        assert item.id in pages["Gamma Node"].memory_ids
+        page = engine.read_page("Gamma Node")
+        assert page is not None
+        assert "manual anchor" in page
+        assert "routine note for collision handling" in page
+        assert "Gamma-Node" not in _entities(engine)
+
+    def test_full_update_does_not_list_two_entities_for_one_markdown_path(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.create_page("Delta Node", entity_type="topic", content="original delta")[
+            "status"
+        ] == "created"
+        assert "Delta Node" in _page_by_entity(engine)
+        item = engine._memory_service.learn("another routine collision note", tags=["Delta-Node"])
+
+        engine.update(force=True)
+
+        pages = _page_by_entity(engine)
+        assert "Delta Node" in pages
+        assert "Delta-Node" not in pages
+        assert pages["Delta Node"].memory_count == 1
+        assert item.id in pages["Delta Node"].memory_ids
+        page = engine.read_page("Delta Node")
+        assert page is not None
+        assert "original delta" in page
+        assert "another routine collision note" in page
+        assert "Delta-Node" not in _entities(engine)
+
+    def test_learned_slug_collisions_keep_backlinks_on_existing_pages(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        assert engine.create_page("North Node", entity_type="topic", content="north anchor")[
+            "status"
+        ] == "created"
+        assert engine.create_page("South Node", entity_type="topic", content="south anchor")[
+            "status"
+        ] == "created"
+        assert "North Node" in _page_by_entity(engine)
+        item = engine._memory_service.learn(
+            "shared migration topic for both existing pages",
+            tags=["North-Node", "South-Node"],
+        )
+
+        engine.update_for_item(item)
+
+        pages = _page_by_entity(engine)
+        assert "North Node" in pages
+        assert "South Node" in pages
+        assert "North-Node" not in pages
+        assert "South-Node" not in pages
+        assert item.id in pages["North Node"].memory_ids
+        assert item.id in pages["South Node"].memory_ids
+        assert "South Node" in pages["North Node"].backlinks
+        assert "North Node" in pages["South Node"].backlinks
+        north_page = engine.read_page("North Node")
+        south_page = engine.read_page("South Node")
+        assert north_page is not None and "shared migration topic" in north_page
+        assert south_page is not None and "shared migration topic" in south_page
+
+
+class TestLivingWikiAutomaticLearnedMemoryUpdates:
+    def test_batch_learn_updates_auto_wiki_and_refreshes_cached_list(self, tmp_path: Path) -> None:
+        memory_service, engine = _auto_wiki(tmp_path)
+        engine.init()
+        assert engine.list_pages() == []
+
+        result = memory_service.batch_learn(
+            [
+                {
+                    "content": "first batch note for the living wiki",
+                    "tags": ["batch-alpha"],
+                },
+                {
+                    "content": "second batch note for the living wiki",
+                    "tags": ["batch-beta"],
+                },
+            ]
+        )
+
+        assert result["learned"] == 2
+        pages = _page_by_entity(engine)
+        assert "batch-alpha" in pages
+        assert "batch-beta" in pages
+        assert pages["batch-alpha"].memory_count == 1
+        assert pages["batch-beta"].memory_count == 1
+        assert result["items"][0]["id"] in pages["batch-alpha"].memory_ids
+        assert result["items"][1]["id"] in pages["batch-beta"].memory_ids
+
+    def test_batch_learn_slug_collision_keeps_existing_page_links(self, tmp_path: Path) -> None:
+        memory_service, engine = _auto_wiki(tmp_path)
+        engine.init()
+        assert engine.create_page("Batch Anchor", entity_type="topic", content="anchor body")[
+            "status"
+        ] == "created"
+        assert engine.create_page("Batch Partner", entity_type="topic", content="partner body")[
+            "status"
+        ] == "created"
+        assert _entities(engine) == ["Batch Anchor", "Batch Partner"]
+
+        result = memory_service.batch_learn(
+            [
+                {
+                    "content": "batch collision memory should land on both existing pages",
+                    "tags": ["Batch-Anchor", "Batch-Partner"],
+                }
+            ]
+        )
+
+        item_id = result["items"][0]["id"]
+        pages = _page_by_entity(engine)
+        assert "Batch Anchor" in pages
+        assert "Batch Partner" in pages
+        assert "Batch-Anchor" not in pages
+        assert "Batch-Partner" not in pages
+        assert item_id in pages["Batch Anchor"].memory_ids
+        assert item_id in pages["Batch Partner"].memory_ids
+        assert "Batch Partner" in pages["Batch Anchor"].backlinks
+        assert "Batch Anchor" in pages["Batch Partner"].backlinks
+        assert len({str(page.path) for page in pages.values()}) == len(pages)
+        stats = engine.stats()
+        assert stats["total_entities"] == 2
+        assert stats["total_memory_links"] == 2
+        assert stats["total_backlinks"] == 2
+
+
+class TestLivingWikiExistingBehavior:
+    def test_exact_duplicate_page_still_returns_already_exists(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        first = engine.create_page("DupEntity", entity_type="default", content="first body")
+        first_body = engine.read_page("DupEntity")
+
+        second = engine.create_page("DupEntity", entity_type="default", content="second body")
+
+        assert first["status"] == "created"
+        assert second["status"] == "already_exists"
+        assert engine.read_page("DupEntity") == first_body
+
+    def test_list_pages_after_update_without_prior_cache_still_has_memory_links(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine._memory_service.learn("A service note concerns release planning", tags=["beacon-topic"])
+
+        result = engine.update(force=True)
+        pages = _page_by_entity(engine)
+
+        assert result.memories_indexed == 1
+        assert "beacon-topic" in pages
+        assert pages["beacon-topic"].memory_count == 1
+
+    def test_read_page_partial_entity_lookup_still_works(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+        engine.init()
+        created = engine.create_page("Project Lighthouse", entity_type="concept", content="Navigation notes")
+
+        page = engine.read_page("Lighthouse")
+
+        assert created["status"] == "created"
+        assert page is not None
+        assert "Project Lighthouse" in page
+        assert "Navigation notes" in page

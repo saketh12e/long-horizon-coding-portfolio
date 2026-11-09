@@ -1,0 +1,19 @@
+{
+  "title": "Tag-aware memory retention",
+  "task_type": "Substantial feature",
+  "codebase_type": "Python memory service with a decay engine, a maintenance facade and administrative HTTP routes",
+  "format": "existing-codebase patch sample",
+  "standalone_runnable": false,
+  "baseline_included": false,
+  "change_scope": "Four production modules add tag-specific decay policy to scoring, public maintenance methods, input schemas and HTTP administration.",
+  "changed_production_files": [
+    "src/memory_service/_maintenance_facade.py",
+    "src/memory_service/api/routes/_admin_analytics.py",
+    "src/memory_service/api/schemas.py",
+    "src/memory_service/decay/engine.py"
+  ],
+  "regression_test_file": "tests/test_tag_aware_retention.py",
+  "testing_approach": "The regression suite exercises the public maintenance facade and an in-process HTTP test client. It checks policy round trips, invalid updates, first-match tag precedence, score and decay behavior, zero-rate preservation, administrative create/list/delete paths, reinforcement and unchanged defaults.",
+  "attribution": "Original memory-service code: Mars375 and contributors. Portfolio feature reference patch, task adaptation and regression tests: Saketh Thumuluri, with AI assistance.",
+  "source_license": "MIT; exact copyright and license notice in notices/LICENSE."
+}

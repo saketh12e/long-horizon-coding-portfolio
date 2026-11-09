@@ -1,0 +1,18 @@
+{
+  "title": "Team-scoped hiring workflow",
+  "task_type": "Substantial feature",
+  "codebase_type": "Python simulation service with SQLAlchemy persistence and an HTTP API",
+  "format": "existing-codebase patch sample",
+  "standalone_runnable": false,
+  "baseline_included": false,
+  "change_scope": "Four production modules connect durable candidate records, team-specific generation, deterministic vote resolution and an eligible-target API.",
+  "changed_production_files": [
+    "managers/gmManager.py",
+    "database/models.py",
+    "managers/teamManager.py",
+    "api/main.py"
+  ],
+  "regression_test_file": "tests/test_team_scoped_hiring.py",
+  "testing_approach": "The regression suite uses deterministic randomness, SQLite-backed candidate records, isolated team fixtures and an API read. It checks candidate reuse and quality spread, vote filtering, cross-team isolation, tie and no-vote decisions, cleanup, and nearby existing behavior.",
+  "attribution": "Original simulation feature contribution: aknous, with AI assistance credited upstream. Portfolio contribution: task adaptation and regression tests by Saketh Thumuluri, with AI assistance."
+}

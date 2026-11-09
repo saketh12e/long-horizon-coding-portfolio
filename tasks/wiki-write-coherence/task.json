@@ -1,0 +1,19 @@
+{
+  "title": "Coherent wiki writes and page identity",
+  "task_type": "Multi-module repair",
+  "codebase_type": "Python local-first memory service with a file-backed wiki and an in-process client",
+  "format": "existing-codebase patch sample",
+  "standalone_runnable": false,
+  "baseline_included": false,
+  "change_scope": "Four production modules coordinate page-list freshness, markdown-path ownership, memory links and batch-learning updates.",
+  "changed_production_files": [
+    "src/memory_service/core.py",
+    "src/memory_service/wiki_engine.py",
+    "src/memory_service/wiki_engine_pages.py",
+    "src/memory_service/wiki_engine_update.py"
+  ],
+  "regression_test_file": "tests/test_wiki_write_coherence.py",
+  "testing_approach": "The regression suite uses temporary wiki directories and the public in-process client. It checks immediate visibility after writes, colliding normalized filenames, preservation of existing markdown, links and backlinks, grouped learning, and nearby read and duplicate-page behavior.",
+  "attribution": "Original memory-service code: Mars375 and contributors. Related upstream repair includes a contribution credited to saketh12e. Portfolio contribution: task adaptation and regression tests by Saketh Thumuluri, with AI assistance.",
+  "source_license": "MIT; exact copyright and license notice in notices/LICENSE."
+}

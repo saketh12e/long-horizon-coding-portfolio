@@ -1,0 +1,5 @@
+Implement stable row tracking in delta-rs at public upstream commit `65e92263a083cd67b5328e9caaf52f1a8467594e`, with native Rust support and Python APIs. A row's identity must survive changes to its values or storage layout. New rows need distinct identities, and each row must report the commit version of its last change. The state must remain correct after concurrent writes, retries, checkpoints, reopen and restore.
+
+Follow TASK_CONTRACT.md and the attributed ROW_TRACKING_PROTOCOL.md. Tracking must be recoverable from the table's Delta log and Parquet files after it is moved to another directory. Preserve existing behavior for tables without row tracking.
+
+The production scope is Rust under crates/core/src/ and python/src/, and Python under python/deltalake/, including new modules. The supplied solution.patch also contains focused investigation tests. Keep upstream manifests and build scripts unchanged; Cargo.lock supplies the dependency closure used by this sample. See WORKSPACE.md for build and API details.

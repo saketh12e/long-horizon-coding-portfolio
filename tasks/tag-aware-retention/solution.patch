@@ -1,0 +1,180 @@
+diff --git a/src/memory_service/_maintenance_facade.py b/src/memory_service/_maintenance_facade.py
+index 26c8d02..690a30c 100644
+--- a/src/memory_service/_maintenance_facade.py
++++ b/src/memory_service/_maintenance_facade.py
+@@ -133,6 +133,30 @@ class MaintenanceFacade:
+                 self._store.upsert(item, namespace=self._namespace)
+         return report
+ 
++    # ── Per-tag decay rate configuration ───────────────────
++
++    def set_decay_rate_for_tag(self, tag: str, rate: float) -> None:
++        """Configure a custom decay rate for memories carrying *tag*.
++
++        Memories with this tag will use *rate* (in the same ``[0.0, 1.0]``
++        domain as the constructor ``decay_rate``) instead of the default
++        rate when :meth:`decay` runs. When a memory carries several tags,
++        the first tag with a configured rate wins.
++        """
++        self._decay.set_decay_rate_for_tag(tag, rate)
++
++    def get_decay_rate_for_tag(self, tag: str) -> float | None:
++        """Return the configured rate for *tag*, or ``None`` when unset."""
++        return self._decay.get_decay_rate_for_tag(tag)
++
++    def list_decay_tag_rates(self) -> dict[str, float]:
++        """Return a copy of the configured ``{tag: rate}`` mapping."""
++        return self._decay.list_decay_tag_rates()
++
++    def clear_decay_rate_for_tag(self, tag: str) -> bool:
++        """Remove the rate mapping for *tag*. Returns ``True`` if it existed."""
++        return self._decay.clear_decay_rate_for_tag(tag)
++
+     def reinforce_memory(
+         self,
+         memory_id: str,
+diff --git a/src/memory_service/api/routes/_admin_analytics.py b/src/memory_service/api/routes/_admin_analytics.py
+index 99f9d48..62352e2 100644
+--- a/src/memory_service/api/routes/_admin_analytics.py
++++ b/src/memory_service/api/routes/_admin_analytics.py
+@@ -4,6 +4,9 @@ from __future__ import annotations
+ 
+ from fastapi import APIRouter
+ 
++from ..errors import error_response
++from ..schemas import TagDecayRateRequest
++
+ 
+ def register_admin_analytics_routes(router: APIRouter, memory_service) -> None:
+     """Register stats and analytics endpoints."""
+@@ -49,3 +52,22 @@ def register_admin_analytics_routes(router: APIRouter, memory_service) -> None:
+     @router.get("/api/v1/analytics/zero-result")
+     async def api_analytics_zero_result(n: int = 20):
+         return {"status": "ok", "results": memory_service.analytics.zero_result_queries(n=n)}
++
++    # ── Per-tag decay rate configuration ───────────────────
++
++    @router.post("/api/v1/admin/decay/tag-rates")
++    async def set_tag_decay_rate(body: TagDecayRateRequest):
++        try:
++            memory_service.set_decay_rate_for_tag(body.tag, body.rate)
++        except (ValueError, TypeError) as exc:
++            return error_response(str(exc), status_code=400)
++        return {"status": "ok", "tag": body.tag, "rate": body.rate}
++
++    @router.get("/api/v1/admin/decay/tag-rates")
++    async def list_tag_decay_rates():
++        return {"status": "ok", "rates": memory_service.list_decay_tag_rates()}
++
++    @router.delete("/api/v1/admin/decay/tag-rates/{tag}")
++    async def clear_tag_decay_rate(tag: str):
++        cleared = memory_service.clear_decay_rate_for_tag(tag)
++        return {"status": "ok", "cleared": cleared, "tag": tag}
+diff --git a/src/memory_service/api/schemas.py b/src/memory_service/api/schemas.py
+index 508a7b9..c04ad70 100644
+--- a/src/memory_service/api/schemas.py
++++ b/src/memory_service/api/schemas.py
+@@ -207,6 +207,13 @@ class DecayRunRequest(BaseModel):
+     dry_run: bool = True
+ 
+ 
++class TagDecayRateRequest(BaseModel):
++    """Configure the decay rate for memories carrying a specific tag."""
++
++    tag: str = Field(..., min_length=1)
++    rate: float = Field(..., ge=0.0, le=1.0)
++
++
+ class ReinforceRequest(BaseModel):
+     """Boost a memory's importance."""
+ 
+diff --git a/src/memory_service/decay/engine.py b/src/memory_service/decay/engine.py
+index 93c0923..2934ead 100644
+--- a/src/memory_service/decay/engine.py
++++ b/src/memory_service/decay/engine.py
+@@ -85,13 +85,72 @@ class DecayEngine:
+         self.auto_reinforce = auto_reinforce
+         self.importance_floor = importance_floor
+         self.decay_min_age_days = decay_min_age_days
++        # Per-tag decay rates. When a memory carries one of these tags, the
++        # matching rate replaces the default ``self.rate`` for that memory.
++        # The first tag (in the order the user registered) wins, so callers
++        # can express "ephemeral" > "permanent" priorities explicitly.
++        self._tag_decay_rates: dict[str, float] = {}
++
++    # ------------------------------------------------------------------
++    # Per-tag decay rate configuration
++    # ------------------------------------------------------------------
++
++    def set_decay_rate_for_tag(self, tag: str, rate: float) -> None:
++        """Configure a custom decay rate for memories carrying *tag*.
++
++        Parameters
++        ----------
++        tag:
++            The tag name (e.g. ``"ephemeral"`` or ``"permanent"``). Lookups
++            are exact, case-sensitive matches against ``item.tags``.
++        rate:
++            The decay rate to apply, expressed as a probability per day
++            and clamped to the same ``[0.0, 1.0]`` domain as the default
++            ``rate`` constructor argument.
++
++        Raises
++        ------
++        ValueError
++            If ``tag`` is empty/blank, or if ``rate`` is outside ``[0.0, 1.0]``.
++        """
++        if tag is None or not str(tag).strip():
++            raise ValueError("Tag must be a non-empty string")
++        if not (0.0 <= float(rate) <= 1.0):
++            raise ValueError(f"Decay rate must be in [0.0, 1.0], got {rate!r}")
++        self._tag_decay_rates[str(tag)] = float(rate)
++
++    def get_decay_rate_for_tag(self, tag: str) -> Optional[float]:
++        """Return the configured rate for *tag*, or ``None`` when unconfigured."""
++        if not tag:
++            return None
++        return self._tag_decay_rates.get(tag)
++
++    def list_decay_tag_rates(self) -> dict[str, float]:
++        """Return a copy of every configured ``{tag: rate}`` mapping."""
++        return dict(self._tag_decay_rates)
++
++    def clear_decay_rate_for_tag(self, tag: str) -> bool:
++        """Remove the rate mapping for *tag*. Returns ``True`` if it existed."""
++        return self._tag_decay_rates.pop(tag, None) is not None
++
++    def _rate_for_item(self, item: MemoryItem) -> float:
++        """Return the decay rate to use for *item* based on its tags.
++
++        The first tag in ``item.tags`` that has a configured rate wins.
++        A memory with no matching tag falls back to the default ``self.rate``.
++        """
++        for tag in item.tags or ():
++            if tag in self._tag_decay_rates:
++                return self._tag_decay_rates[tag]
++        return self.rate
+ 
+     def adjusted_score(self, base_score: float, item: MemoryItem) -> float:
+         """Calculate decay-adjusted relevance score."""
+         age_days = (time.time() - item.created_at) / SECONDS_PER_DAY
++        rate = self._rate_for_item(item)
+ 
+         # Exponential decay
+-        decay_factor = (1 - self.rate) ** age_days
++        decay_factor = (1 - rate) ** age_days
+ 
+         # Access reinforcement
+         access_bonus = item.importance * self.reinforce_strength * math.log(item.access_count + 1)
+@@ -157,8 +216,9 @@ class DecayEngine:
+             if item.importance >= PERMANENT_IMPORTANCE_THRESHOLD:
+                 continue
+ 
+-            # Calculate decay factor
+-            decay_factor = (1 - self.rate) ** age_days
++            # Calculate decay factor — use the per-tag rate when one matches
++            rate = self._rate_for_item(item)
++            decay_factor = (1 - rate) ** age_days
+ 
+             # New importance = max(floor, original * decay_factor)
+             new_importance = max(imp_floor, item.importance * decay_factor)

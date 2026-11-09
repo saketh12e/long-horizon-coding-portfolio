@@ -1,0 +1,4055 @@
+diff --git a/crates/core/src/delta_datafusion/mod.rs b/crates/core/src/delta_datafusion/mod.rs
+index 3b0c404..4176cdc 100644
+--- a/crates/core/src/delta_datafusion/mod.rs
++++ b/crates/core/src/delta_datafusion/mod.rs
+@@ -83,6 +83,19 @@ pub(crate) use table_provider::{
+ 
+ pub(crate) const PATH_COLUMN: &str = "__delta_rs_path";
+ 
++impl DeltaScanConfig {
++    /// Include stable row IDs and row commit versions in native provider scans.
++    ///
++    /// The snapshot must have row tracking enabled. The two non-null Int64 fields
++    /// are appended after user columns, before any optional file ID column.
++    /// Materialized metadata takes precedence over per-file defaults, and default
++    /// row IDs use physical Parquet positions before deletion vectors or filters.
++    pub fn with_row_tracking(mut self, include: bool) -> Self {
++        self.include_row_tracking = include;
++        self
++    }
++}
++
+ #[doc(hidden)]
+ pub mod bench_support;
+ pub mod cdf;
+diff --git a/crates/core/src/delta_datafusion/table_provider.rs b/crates/core/src/delta_datafusion/table_provider.rs
+index fd535ab..4afcd41 100644
+--- a/crates/core/src/delta_datafusion/table_provider.rs
++++ b/crates/core/src/delta_datafusion/table_provider.rs
+@@ -151,6 +151,7 @@ impl DeltaScanConfigBuilder {
+         };
+ 
+         Ok(DeltaScanConfig {
++            include_row_tracking: false,
+             file_column_name,
+             wrap_partition_values: self.wrap_partition_values.unwrap_or(true),
+             enable_parquet_pushdown: self.enable_parquet_pushdown,
+@@ -163,6 +164,9 @@ impl DeltaScanConfigBuilder {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ /// Include additional metadata columns during a [`crate::delta_datafusion::DeltaScanNext`]
+ pub struct DeltaScanConfig {
++    /// Expose stable row IDs and row commit versions; requires enabled row tracking.
++    #[serde(default)]
++    pub include_row_tracking: bool,
+     /// Include the source path for each record
+     pub file_column_name: Option<String>,
+     /// Wrap partition values in a dictionary encoding, defaults to true
+@@ -186,6 +190,7 @@ impl DeltaScanConfig {
+     /// Create a new default [`DeltaScanConfig`]
+     pub fn new() -> Self {
+         Self {
++            include_row_tracking: false,
+             file_column_name: None,
+             wrap_partition_values: true,
+             enable_parquet_pushdown: true,
+@@ -199,6 +204,7 @@ impl DeltaScanConfig {
+     pub fn new_from_session(session: &dyn Session) -> Self {
+         let config_options = session.config().options();
+         Self {
++            include_row_tracking: false,
+             file_column_name: None,
+             wrap_partition_values: true,
+             enable_parquet_pushdown: config_options.execution.parquet.pushdown_filters,
+@@ -242,6 +248,7 @@ impl DeltaScanConfig {
+ /// or an eager snapshot. If some Snapshot is provided, that will be used directly,
+ /// and no IO will be performed when building the provider.
+ pub struct TableProviderBuilder {
++    include_row_tracking: bool,
+     log_store: Option<Arc<dyn LogStore>>,
+     snapshot: Option<SnapshotWrapper>,
+     session: Option<Arc<dyn Session>>,
+@@ -279,6 +286,7 @@ impl Default for TableProviderBuilder {
+ impl TableProviderBuilder {
+     fn new() -> Self {
+         Self {
++            include_row_tracking: false,
+             log_store: None,
+             snapshot: None,
+             session: None,
+@@ -291,6 +299,12 @@ impl TableProviderBuilder {
+         }
+     }
+ 
++    /// Include non-null Int64 stable row IDs and row commit versions in scans.
++    pub fn with_row_tracking(mut self, include: bool) -> Self {
++        self.include_row_tracking = include;
++        self
++    }
++
+     /// Provide the log store to use for the table provider
+     pub fn with_log_store(mut self, log_store: impl Into<Arc<dyn LogStore>>) -> Self {
+         self.log_store = Some(log_store.into());
+@@ -386,6 +400,7 @@ impl TableProviderBuilder {
+     /// Consume the builder and resolve it into an executable [`next::DeltaScan`].
+     pub async fn build(self) -> Result<next::DeltaScan> {
+         let TableProviderBuilder {
++            include_row_tracking,
+             log_store,
+             snapshot,
+             session,
+@@ -402,6 +417,7 @@ impl TableProviderBuilder {
+             .map_or_else(DeltaScanConfig::new, |session| {
+                 DeltaScanConfig::new_from_session(session.as_ref())
+             });
++        config = config.with_row_tracking(include_row_tracking);
+         if let Some(file_column) = file_column {
+             config = config.with_file_column_name(file_column);
+         }
+diff --git a/crates/core/src/delta_datafusion/table_provider/next/scan/exec.rs b/crates/core/src/delta_datafusion/table_provider/next/scan/exec.rs
+index b78a845..95398d0 100644
+--- a/crates/core/src/delta_datafusion/table_provider/next/scan/exec.rs
++++ b/crates/core/src/delta_datafusion/table_provider/next/scan/exec.rs
+@@ -576,6 +576,7 @@ impl ExecutionPlan for DeltaScanExec {
+             file_id_column: self.file_id_column.clone(),
+             row_index_field: self.scan_plan.contract.retained_row_index_field(),
+             row_index_by_file: HashMap::new(),
++            physical_position_by_file: HashMap::new(),
+             pending: VecDeque::new(),
+             schema_adapter: super::SchemaAdapter::new(Arc::clone(
+                 &self.scan_plan.contract.result_schema,
+@@ -741,6 +742,8 @@ struct DeltaScanStream {
+     /// `DataSourceExec` assigns whole `PartitionedFile`s to file groups. Each physical file has
+     /// one scan stream partition owner.
+     row_index_by_file: HashMap<String, u64>,
++    /// Raw physical rows consumed from each unsplit file, before any DV selection.
++    physical_position_by_file: HashMap<String, i64>,
+     pending: VecDeque<RecordBatch>,
+     /// Cached schema adapter for efficient batch adaptation across batches
+     schema_adapter: super::SchemaAdapter,
+@@ -769,23 +772,64 @@ impl DeltaScanStream {
+ 
+     fn batch_project_single_file(
+         &mut self,
+-        batch: RecordBatch,
++        mut batch: RecordBatch,
+         file_id: String,
+-        mut file_id_idx: usize,
++        _file_id_idx: usize,
+     ) -> Result<RecordBatch> {
+-        let mut batch = if let Some(entries) = &self.entries {
++        // Resolve both fallback and materialized metadata while the input still has its
++        // physical positions. Apply exactly the same DV mask to user and metadata arrays.
++        let physical_positions = if self.scan_plan.row_tracking.is_some() {
++            let next = self
++                .physical_position_by_file
++                .entry(file_id.clone())
++                .or_default();
++            let count = i64::try_from(batch.num_rows())
++                .map_err(|_| DataFusionError::Execution("physical row count overflow".into()))?;
++            let end = next.checked_add(count).ok_or_else(|| {
++                DataFusionError::Execution("physical row position overflow".into())
++            })?;
++            let positions = arrow_array::Int64Array::from_iter_values(*next..end);
++            *next = end;
++            Some(positions)
++        } else {
++            None
++        };
++        let mut tracking_batch = self
++            .scan_plan
++            .row_tracking
++            .as_ref()
++            .map(|tracking| {
++                reconstruct_row_tracking(
++                    tracking,
++                    &batch,
++                    &file_id,
++                    physical_positions
++                        .as_ref()
++                        .expect("tracked scan has physical positions"),
++                )
++            })
++            .transpose()?;
++        if let Some(entries) = &self.entries {
+             let entry = entries.get(&file_id).ok_or_else(|| {
+                 DataFusionError::Execution(format!("unknown compact file id '{file_id}'"))
+             })?;
+-            let position_idx = batch.schema().index_of(super::PHYSICAL_POSITION_COLUMN)?;
+-            let mut filtered = if let Some(mask) = &entry.keep_mask {
+-                let positions = batch
+-                    .column(position_idx)
+-                    .as_any()
+-                    .downcast_ref::<arrow_array::Int64Array>()
+-                    .ok_or_else(|| {
+-                        DataFusionError::Execution("physical row position is not Int64".into())
+-                    })?;
++            let position_idx = if physical_positions.is_some() {
++                None
++            } else {
++                Some(batch.schema().index_of(super::PHYSICAL_POSITION_COLUMN)?)
++            };
++            if let Some(mask) = &entry.keep_mask {
++                let positions = if let Some(positions) = &physical_positions {
++                    positions
++                } else {
++                    batch
++                        .column(position_idx.expect("DV scan has physical position column"))
++                        .as_any()
++                        .downcast_ref::<arrow_array::Int64Array>()
++                        .ok_or_else(|| {
++                            DataFusionError::Execution("physical row position is not Int64".into())
++                        })?
++                };
+                 let selection = positions
+                     .iter()
+                     .map(|position| {
+@@ -805,25 +849,39 @@ impl DeltaScanStream {
+                                 "physical row position overflows usize".into(),
+                             )
+                         })?;
+-                        // Kernel omits trailing live rows from DV masks.
+                         Ok(mask.get(index).copied().unwrap_or(true))
+                     })
+                     .collect::<Result<BooleanArray>>()?;
+-                filter_record_batch(&batch, &selection)?
+-            } else {
+-                batch
+-            };
+-            if position_idx < file_id_idx {
+-                file_id_idx -= 1;
++                batch = filter_record_batch(&batch, &selection)?;
++                tracking_batch = tracking_batch
++                    .map(|metadata| filter_record_batch(&metadata, &selection))
++                    .transpose()?;
+             }
+-            filtered.remove_column(position_idx);
+-            filtered
+-        } else {
+-            batch
+-        };
++            if let Some(position_idx) = position_idx {
++                batch.remove_column(position_idx);
++            }
++        }
++        if let Some(tracking) = &self.scan_plan.row_tracking {
++            for name in [
++                &tracking.materialized_row_id,
++                &tracking.materialized_commit_version,
++            ] {
++                let index = batch.schema().index_of(name)?;
++                batch.remove_column(index);
++            }
++        }
++        let file_id_idx = file_id_column_idx(&batch, &self.input_file_id_column)?;
+         batch.remove_column(file_id_idx);
+ 
+-        let result = if let Some(transform) = self.transforms.get(&file_id) {
++        let result = if self.scan_plan.row_tracking.is_some()
++            && self.scan_plan.scan.logical_schema().fields().len() == 0
++        {
++            RecordBatch::try_new_with_options(
++                Arc::new(Schema::empty()),
++                vec![],
++                &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
++            )?
++        } else if let Some(transform) = self.transforms.get(&file_id) {
+             let evaluator = ARROW_HANDLER
+                 .new_expression_evaluator(
+                     self.scan_plan.scan.physical_schema().clone(),
+@@ -831,13 +889,32 @@ impl DeltaScanStream {
+                     self.kernel_type.clone(),
+                 )
+                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+             evaluator
+                 .evaluate_arrow(batch)
+                 .map_err(|e| DataFusionError::External(Box::new(e)))?
+         } else {
+             batch
+         };
++        let result = if let Some(metadata) = tracking_batch {
++            let mut fields = result.schema().fields().to_vec();
++            fields.extend(metadata.schema().fields().iter().cloned());
++            let mut columns = result.columns().to_vec();
++            columns.extend(metadata.columns().iter().cloned());
++            let result = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
++            // Kernel transforms contain user columns only; restore the requested order,
++            // including metadata-only and interleaved user/metadata projections.
++            let projection = self
++                .scan_plan
++                .contract
++                .scan_schema
++                .fields()
++                .iter()
++                .map(|field| result.schema().index_of(field.name()))
++                .collect::<std::result::Result<Vec<_>, _>>()?;
++            result.project(&projection)?
++        } else {
++            result
++        };
+ 
+         let result = if let Some(file_id_column) = &self.file_id_column {
+             let public_file_id = super::public_file_id(&self.public_file_ids, &file_id)?;
+@@ -858,7 +935,6 @@ impl DeltaScanStream {
+                 &mut self.schema_adapter,
+             )
+         }?;
+-
+         self.append_row_index(result, &file_id)
+     }
+ 
+@@ -901,6 +977,75 @@ impl DeltaScanStream {
+     }
+ }
+ 
++/// Reconstruct metadata before any row selection. Physical positions are zero based
++/// and are counted on unsplit, unfiltered file input across row groups and batches.
++fn reconstruct_row_tracking(
++    tracking: &super::plan::RowTrackingContext,
++    batch: &RecordBatch,
++    file_id: &str,
++    positions: &arrow_array::Int64Array,
++) -> Result<RecordBatch> {
++    use crate::kernel::row_tracking::{ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
++    use arrow_array::Int64Array;
++
++    let (base, default_version) = tracking.defaults.get(file_id).copied().ok_or_else(|| {
++        DataFusionError::Execution(format!(
++            "missing row tracking defaults for file '{file_id}'"
++        ))
++    })?;
++    if base < 0 || default_version < 0 {
++        return exec_err!("negative row tracking defaults");
++    }
++    let int64_column = |name: &str| -> Result<&Int64Array> {
++        batch
++            .column_by_name(name)
++            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
++            .ok_or_else(|| {
++                DataFusionError::Execution(format!("row tracking column '{name}' must be Int64"))
++            })
++    };
++    let materialized_ids = int64_column(&tracking.materialized_row_id)?;
++    let materialized_versions = int64_column(&tracking.materialized_commit_version)?;
++    let mut ids = Vec::with_capacity(batch.num_rows());
++    let mut versions = Vec::with_capacity(batch.num_rows());
++    for row in 0..batch.num_rows() {
++        if positions.is_null(row) || positions.value(row) < 0 {
++            return exec_err!("invalid physical position for row tracking");
++        }
++        let id = if materialized_ids.is_valid(row) {
++            materialized_ids.value(row)
++        } else {
++            base.checked_add(positions.value(row)).ok_or_else(|| {
++                DataFusionError::Execution("row ID reconstruction overflow".into())
++            })?
++        };
++        let version = if materialized_versions.is_valid(row) {
++            materialized_versions.value(row)
++        } else {
++            default_version
++        };
++        if id < 0 || version < 0 {
++            return exec_err!("negative materialized row ID or row commit version");
++        }
++        ids.push(id);
++        versions.push(version);
++    }
++    Ok(RecordBatch::try_new(
++        Arc::new(Schema::new(vec![
++            arrow_schema::Field::new(ROW_ID_COLUMN, arrow_schema::DataType::Int64, false),
++            arrow_schema::Field::new(
++                ROW_COMMIT_VERSION_COLUMN,
++                arrow_schema::DataType::Int64,
++                false,
++            ),
++        ])),
++        vec![
++            Arc::new(Int64Array::from(ids)),
++            Arc::new(Int64Array::from(versions)),
++        ],
++    )?)
++}
++
+ impl Stream for DeltaScanStream {
+     type Item = Result<RecordBatch>;
+ 
+@@ -1088,6 +1233,71 @@ mod tests {
+     };
+ 
+     use super::*;
++
++    #[test]
++    fn test_row_tracking_uses_physical_positions_and_materialized_null_fallback() -> TestResult {
++        use arrow_array::Int64Array;
++        use arrow_schema::{DataType, Field};
++        let mut tracking = super::super::plan::RowTrackingContext {
++            materialized_row_id: "physical_id".into(),
++            materialized_commit_version: "physical_version".into(),
++            defaults: HashMap::new(),
++        };
++        tracking.defaults.insert("0".into(), (100, 9));
++        let batch = RecordBatch::try_new(
++            Arc::new(Schema::new(vec![
++                Field::new(
++                    super::super::PHYSICAL_POSITION_COLUMN,
++                    DataType::Int64,
++                    false,
++                ),
++                Field::new("physical_id", DataType::Int64, true),
++                Field::new("physical_version", DataType::Int64, true),
++            ])),
++            vec![
++                Arc::new(Int64Array::from(vec![8, 2, 17])),
++                Arc::new(Int64Array::from(vec![None, Some(44), None])),
++                Arc::new(Int64Array::from(vec![Some(4), None, None])),
++            ],
++        )?;
++        let positions = batch
++            .column(0)
++            .as_any()
++            .downcast_ref::<Int64Array>()
++            .unwrap();
++        let metadata = reconstruct_row_tracking(&tracking, &batch, "0", positions)?;
++        assert_eq!(
++            metadata
++                .column(0)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap(),
++            &Int64Array::from(vec![108, 44, 117])
++        );
++        assert_eq!(
++            metadata
++                .column(1)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap(),
++            &Int64Array::from(vec![4, 9, 9])
++        );
++        let selected =
++            filter_record_batch(&metadata, &BooleanArray::from(vec![true, false, true]))?;
++        assert_eq!(
++            selected
++                .column(0)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap(),
++            &Int64Array::from(vec![108, 117])
++        );
++        tracking.defaults.insert("0".into(), (i64::MAX, 9));
++        assert!(reconstruct_row_tracking(&tracking, &batch, "0", positions).is_err());
++        assert!(reconstruct_row_tracking(&tracking, &batch, "unknown", positions).is_err());
++        Ok(())
++    }
++
+     use crate::{
+         assert_batches_sorted_eq,
+         delta_datafusion::{
+@@ -2918,6 +3128,7 @@ mod tests {
+             file_id_column,
+             row_index_field,
+             row_index_by_file: HashMap::new(),
++            physical_position_by_file: HashMap::new(),
+             pending: VecDeque::new(),
+             schema_adapter,
+         }
+diff --git a/crates/core/src/delta_datafusion/table_provider/next/scan/mod.rs b/crates/core/src/delta_datafusion/table_provider/next/scan/mod.rs
+index f216c59..e9bcddb 100644
+--- a/crates/core/src/delta_datafusion/table_provider/next/scan/mod.rs
++++ b/crates/core/src/delta_datafusion/table_provider/next/scan/mod.rs
+@@ -135,7 +135,7 @@ pub(super) async fn execution_plan(
+         && selection.active_file_ids.is_empty()
+     {
+         return Ok(Arc::new(EmptyExec::new(
+-            scan_plan.contract.result_schema.clone(),
++            scan_plan.contract.output_schema.clone(),
+         )));
+     }
+ 
+@@ -484,6 +484,7 @@ fn normalize_dv_keep_mask_for_api(
+ 
+ fn validate_dv_parquet_metadata(
+     metadata: &ParquetMetaData,
++    require_row_group_ordinals: bool,
+     log_count: Option<u64>,
+     mask_len: usize,
+     id: &str,
+@@ -497,15 +498,17 @@ fn validate_dv_parquet_metadata(
+     }
+     let mut total = 0_u64;
+     for (group_index, group) in metadata.row_groups().iter().enumerate() {
+-        let Ok(expected) = i16::try_from(group_index) else {
+-            return plan_err!(
+-                "Parquet row-group index {group_index} exceeds i16 for file id '{id}'"
+-            );
+-        };
+-        if group.ordinal() != Some(expected) {
+-            return plan_err!(
+-                "Parquet row-group ordinal is missing or inconsistent for file id '{id}'"
+-            );
++        if require_row_group_ordinals {
++            let Ok(expected) = i16::try_from(group_index) else {
++                return plan_err!(
++                    "Parquet row-group index {group_index} exceeds i16 for file id '{id}'"
++                );
++            };
++            if group.ordinal() != Some(expected) {
++                return plan_err!(
++                    "Parquet row-group ordinal is missing or inconsistent for file id '{id}'"
++                );
++            }
+         }
+         let rows = u64::try_from(group.num_rows()).map_err(|_| {
+             DataFusionError::Plan(format!(
+@@ -527,7 +530,10 @@ fn validate_dv_parquet_metadata(
+         .root_schema()
+         .get_fields()
+         .iter()
+-        .any(|field| field.name() == PHYSICAL_POSITION_COLUMN || field.name() == file_id_name)
++        .any(|field| {
++            (require_row_group_ordinals && field.name() == PHYSICAL_POSITION_COLUMN)
++                || field.name() == file_id_name
++        })
+     {
+         return plan_err!(
+             "Parquet field collides with an internal DV scan column for file id '{id}'"
+@@ -541,7 +547,7 @@ fn validate_dv_parquet_metadata(
+ 
+ async fn get_data_scan_plan(
+     session: &dyn Session,
+-    scan_plan: KernelScanPlan,
++    mut scan_plan: KernelScanPlan,
+     replayed: ReplayedScanFiles,
+     limit: Option<usize>,
+     file_pruner: Option<Arc<RuntimeScanFilePruner>>,
+@@ -554,7 +560,18 @@ async fn get_data_scan_plan(
+         metrics,
+         ..
+     } = replayed;
+-    let has_deletion_vectors = !dvs.is_empty();
++    // Tracking also needs physical positions and the same optimizer boundary as DVs.
++    let has_deletion_vectors = !dvs.is_empty() || scan_plan.row_tracking.is_some();
++    if let Some(tracking) = &mut scan_plan.row_tracking {
++        for (index, file) in files.iter().enumerate() {
++            let defaults = file.row_tracking_defaults.ok_or_else(|| {
++                DataFusionError::Execution("tracked file has no row tracking defaults".into())
++            })?;
++            tracking
++                .defaults
++                .insert(compact_internal_file_id(index), defaults);
++        }
++    }
+     let mut partition_stats = HashMap::new();
+     let log_counts: Vec<_> = files.iter().map(|file| file.num_records).collect();
+ 
+@@ -601,13 +618,15 @@ async fn get_data_scan_plan(
+     let mut dv_metadata_caches: HashMap<ObjectStoreUrl, Arc<FileMetadataCache>> = HashMap::new();
+     let mut uses_dv_cache = vec![false; partitioned_files.len()];
+ 
++    let tracked = scan_plan.row_tracking.is_some();
+     let dv_state = if has_deletion_vectors {
+         let file_id_name = scan_plan.contract.file_id_field.name();
+-        if file_id_name == PHYSICAL_POSITION_COLUMN
+-            || scan_plan
+-                .parquet_read_schema
+-                .field_with_name(PHYSICAL_POSITION_COLUMN)
+-                .is_ok()
++        if !tracked
++            && (file_id_name == PHYSICAL_POSITION_COLUMN
++                || scan_plan
++                    .parquet_read_schema
++                    .field_with_name(PHYSICAL_POSITION_COLUMN)
++                    .is_ok())
+         {
+             return plan_err!("physical position column conflicts with the scan schema");
+         }
+@@ -666,6 +685,7 @@ async fn get_data_scan_plan(
+                         .await?;
+                     let count = validate_dv_parquet_metadata(
+                         &metadata,
++                        !tracked,
+                         log_count,
+                         mask.len(),
+                         &id,
+@@ -719,6 +739,7 @@ async fn get_data_scan_plan(
+     let file_id_field = scan_plan.contract.file_id_field.clone();
+     let pq_plan = get_read_plan(
+         session,
++        tracked,
+         files_by_store,
+         &scan_plan.parquet_read_schema,
+         &scan_plan.parquet_predicate_schema,
+@@ -942,6 +963,7 @@ fn partitioned_files_to_file_groups_with_limit(
+ #[allow(clippy::too_many_arguments)]
+ async fn get_read_plan(
+     state: &dyn Session,
++    tracked: bool,
+     files_by_store: impl IntoIterator<Item = FilesByStore>,
+     // Schema of physical file columns to read from Parquet (no Delta partitions, no file-id).
+     //
+@@ -989,7 +1011,7 @@ async fn get_read_plan(
+         // above Parquet, so they are not part of the Parquet partition schema here.
+         let builder = TableSchema::builder(parquet_read_schema.clone())
+             .with_table_partition_cols(vec![file_id_field.clone()]);
+-        let table_schema = if has_deletion_vectors {
++        let table_schema = if has_deletion_vectors && !tracked {
+             builder
+                 .with_virtual_columns(vec![Arc::new(
+                     Field::new(PHYSICAL_POSITION_COLUMN, DataType::Int64, true)
+@@ -1286,7 +1308,7 @@ mod tests {
+         let metadata =
+             ParquetMetaData::new(FileMetaData::new(1, 0, None, None, schema, None), groups);
+ 
+-        let err = validate_dv_parquet_metadata(&metadata, None, 0, "f0", "file_id")
++        let err = validate_dv_parquet_metadata(&metadata, true, None, 0, "f0", "file_id")
+             .expect_err("row-group index must fit i16");
+         assert!(err.to_string().contains("row-group index"));
+         Ok(())
+@@ -1561,6 +1583,7 @@ mod tests {
+             stats: Statistics::new_unknown(&Schema::empty()),
+             num_records: None,
+             partitions: None,
++            row_tracking_defaults: None,
+         }
+     }
+ 
+@@ -1891,6 +1914,7 @@ mod tests {
+ 
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema,
+             &parquet_predicate_schema,
+@@ -1915,6 +1939,7 @@ mod tests {
+         // respect limits
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema,
+             &parquet_predicate_schema,
+@@ -1944,6 +1969,7 @@ mod tests {
+             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema_extended,
+             &parquet_predicate_schema_extended,
+@@ -2019,6 +2045,7 @@ mod tests {
+ 
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema,
+             &parquet_predicate_schema,
+@@ -2058,6 +2085,7 @@ mod tests {
+             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema_extended,
+             &parquet_predicate_schema_extended,
+@@ -2246,6 +2274,7 @@ mod tests {
+ 
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema,
+             &parquet_predicate_schema,
+@@ -2311,6 +2340,7 @@ mod tests {
+         let predicate = col("id").eq(lit(2i32));
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store.clone(),
+             &arrow_schema,
+             &parquet_predicate_schema,
+@@ -2375,6 +2405,7 @@ mod tests {
+ 
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store,
+             &parquet_read_schema,
+             &parquet_predicate_schema,
+@@ -2452,6 +2483,7 @@ mod tests {
+         let predicate = col("name").eq(lit(ScalarValue::Utf8View(Some("bob".to_string()))));
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store,
+             &parquet_read_schema,
+             &parquet_predicate_schema,
+@@ -2526,6 +2558,7 @@ mod tests {
+         let predicate = col("name").eq(lit("bob"));
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store,
+             &parquet_read_schema,
+             &parquet_predicate_schema,
+@@ -2601,6 +2634,7 @@ mod tests {
+         let predicate = col(physical_name).eq(lit("bob"));
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store,
+             &parquet_read_schema,
+             &parquet_predicate_schema,
+@@ -2688,6 +2722,7 @@ mod tests {
+         let predicate = col("data").eq(lit(ScalarValue::BinaryView(Some(b"bbb".to_vec()))));
+         let plan = get_read_plan(
+             &session.state(),
++            false,
+             files_by_store,
+             &parquet_read_schema,
+             &parquet_predicate_schema,
+diff --git a/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs b/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
+index 16f2b4a..50e89e1 100644
+--- a/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
++++ b/crates/core/src/delta_datafusion/table_provider/next/scan/plan.rs
+@@ -39,8 +39,21 @@ use crate::delta_datafusion::engine::{
+     is_exact_partition_predicate, to_datafusion_expr, to_delta_expression, to_delta_predicate,
+ };
+ use crate::delta_datafusion::table_provider::next::FILE_ID_COLUMN_DEFAULT;
++use crate::kernel::row_tracking::{self, ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
+ use crate::kernel::{Scan, Snapshot};
+ 
++fn is_tracking_column(name: &str) -> bool {
++    matches!(name, ROW_ID_COLUMN | ROW_COMMIT_VERSION_COLUMN)
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct RowTrackingContext {
++    pub(crate) materialized_row_id: String,
++    pub(crate) materialized_commit_version: String,
++    /// Compact scan file ID -> (baseRowId, defaultRowCommitVersion).
++    pub(crate) defaults: HashMap<String, (i64, i64)>,
++}
++
+ /// Query scoped contract between the provider, logical planner, and scan execs.
+ ///
+ /// This centralizes all schema and file id visibility decisions for a single
+@@ -236,6 +249,7 @@ pub(crate) struct KernelScanPlan {
+     pub(crate) parquet_predicate_schema: SchemaRef,
+     /// If set, indicates a predicate to apply at the Parquet scan level
+     pub(crate) parquet_predicate: Option<Expr>,
++    pub(crate) row_tracking: Option<RowTrackingContext>,
+ }
+ 
+ impl KernelScanPlan {
+@@ -304,6 +318,7 @@ impl KernelScanPlan {
+                 .fields()
+                 .iter()
+                 .map(|field| field.name().as_str())
++                .filter(|name| !config.include_row_tracking || !is_tracking_column(name))
+                 .collect_vec();
+             let kernel_scan_schema = kernel_logical_schema
+                 .project(&kernel_projection_names)
+@@ -312,10 +327,38 @@ impl KernelScanPlan {
+         } else {
+             Arc::new(scan_builder.build()?)
+         };
++        let row_tracking = if config.include_row_tracking {
++            let (row_id, commit_version) =
++                row_tracking::materialized_column_names(table_config.table_properties())?;
++            Some(RowTrackingContext {
++                materialized_row_id: row_id.to_owned(),
++                materialized_commit_version: commit_version.to_owned(),
++                defaults: HashMap::new(),
++            })
++        } else {
++            None
++        };
+         let parquet_read_schema = config.physical_arrow_schema(
+             scan.snapshot().table_configuration(),
+             &scan.physical_schema().as_ref().try_into_arrow()?,
+         )?;
++        let parquet_read_schema = if let Some(tracking) = &row_tracking {
++            let mut fields = parquet_read_schema.fields().to_vec();
++            for name in [
++                &tracking.materialized_row_id,
++                &tracking.materialized_commit_version,
++            ] {
++                if parquet_read_schema.field_with_name(name).is_ok() {
++                    return plan_err!(
++                        "row tracking physical column '{name}' conflicts with a user column"
++                    );
++                }
++                fields.push(Arc::new(Field::new(name, DataType::Int64, true)));
++            }
++            Arc::new(Schema::new(fields))
++        } else {
++            parquet_read_schema
++        };
+         let parquet_predicate_schema =
+             build_parquet_predicate_schema(&parquet_read_schema, &contract.file_id_field);
+         Ok(Self {
+@@ -325,6 +368,7 @@ impl KernelScanPlan {
+             parquet_read_schema,
+             parquet_predicate_schema,
+             parquet_predicate,
++            row_tracking,
+         })
+     }
+ 
+@@ -333,7 +377,7 @@ impl KernelScanPlan {
+     /// It may still be impossible to perform a metadata-only scan if the
+     /// file statistics are not sufficient to satisfy the query.
+     pub(crate) fn is_metadata_only(&self) -> bool {
+-        self.scan.physical_schema().fields().len() == 0
++        self.row_tracking.is_none() && self.scan.physical_schema().fields().len() == 0
+     }
+ 
+     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
+@@ -378,11 +422,27 @@ impl DeltaScanConfig {
+     /// such as dictionary encoding of partition columns or
+     /// view types.
+     pub(crate) fn table_schema(&self, table_config: &TableConfiguration) -> Result<SchemaRef> {
+-        if let Some(schema) = &self.schema {
+-            return Ok(schema.clone());
++        let schema = if let Some(schema) = &self.schema {
++            schema.clone()
++        } else {
++            let table_schema: Schema = table_config.logical_schema().as_ref().try_into_arrow()?;
++            self.physical_arrow_schema(table_config, &table_schema)?
++        };
++        if !self.include_row_tracking {
++            return Ok(schema);
+         }
+-        let table_schema: Schema = table_config.logical_schema().as_ref().try_into_arrow()?;
+-        self.physical_arrow_schema(table_config, &table_schema)
++        if !row_tracking::is_enabled(table_config.table_properties()) {
++            return plan_err!("row tracking metadata requires delta.enableRowTracking=true");
++        }
++        row_tracking::materialized_column_names(table_config.table_properties())?;
++        let mut fields = schema.fields().to_vec();
++        for name in [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN] {
++            if schema.field_with_name(name).is_ok() {
++                return plan_err!("user column '{name}' conflicts with row tracking metadata");
++            }
++            fields.push(Arc::new(Field::new(name, DataType::Int64, false)));
++        }
++        Ok(Arc::new(Schema::new(fields)))
+     }
+ 
+     fn physical_arrow_schema(
+@@ -580,7 +640,12 @@ fn process_predicate<'a>(
+         only_partition_refs || expr.column_refs().iter().any(|c| cols.contains(&c.name));
+     let has_file_id = expr.column_refs().iter().any(|c| file_id_column == c.name);
+ 
+-    if has_file_id {
++    let has_tracking = scan_config.include_row_tracking
++        && expr
++            .column_refs()
++            .iter()
++            .any(|column| is_tracking_column(&column.name));
++    if has_file_id || has_tracking {
+         // file-id filters cannot be evaluated in kernel and must not be pushed to parquet.
+         // Mark as Unsupported so DataFusion keeps a post-scan filter for correctness.
+         return ProcessedPredicate {
+diff --git a/crates/core/src/delta_datafusion/table_provider/next/scan/replay.rs b/crates/core/src/delta_datafusion/table_provider/next/scan/replay.rs
+index d1212cf..1ceb612 100644
+--- a/crates/core/src/delta_datafusion/table_provider/next/scan/replay.rs
++++ b/crates/core/src/delta_datafusion/table_provider/next/scan/replay.rs
+@@ -218,16 +218,35 @@ where
+                         }
+                     }
+                 };
+-                Poll::Ready(Some(Ok(ctx
++                Poll::Ready(Some(ctx
+                     .files
+                     .into_iter()
+-                    .map(|ctx| {
+-                        let (stats, partitions) = file_statistics
++                    .enumerate()
++                    .map(|(index, ctx)| {
++                        let (mut stats, partitions) = file_statistics
+                             .remove(&ctx.file_url)
+                             .unwrap_or_else(|| (unknown_stats(), None));
+-                        ScanFileContext::new(ctx, stats, partitions)
++                        if this.scan_config.include_row_tracking && !stats.column_statistics.is_empty() {
++                            stats.column_statistics.extend([
++                                ColumnStatistics::new_unknown(),
++                                ColumnStatistics::new_unknown(),
++                            ]);
++                        }
++                        let mut file = ScanFileContext::new(ctx, stats, partitions);
++                        if this.scan_config.include_row_tracking {
++                            let add = LogicalFileView::new(scan_files.clone(), index).to_add();
++                            match (add.base_row_id, add.default_row_commit_version) {
++                                (Some(base), Some(version)) if base >= 0 && version >= 0 => {
++                                    file.row_tracking_defaults = Some((base, version));
++                                }
++                                _ => return Err(DeltaTableError::InvalidData {
++                                    message: "tracked file has missing or negative row tracking defaults".into(),
++                                }),
++                            }
++                        }
++                        Ok(file)
+                     })
+-                    .collect_vec())))
++                    .collect::<DeltaResult<Vec<_>>>()))
+             }
+             Poll::Ready(None) => Poll::Ready(None),
+             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+@@ -410,6 +429,8 @@ pub(crate) struct ScanFileContext {
+     pub num_records: Option<u64>,
+     /// Partition values for the file.
+     pub partitions: Option<StructData>,
++    /// Persisted defaults used to reconstruct stable row metadata.
++    pub row_tracking_defaults: Option<(i64, i64)>,
+ }
+ 
+ impl ScanFileContext {
+@@ -422,6 +443,7 @@ impl ScanFileContext {
+             stats,
+             num_records: inner.num_records,
+             partitions,
++            row_tracking_defaults: None,
+         }
+     }
+ }
+diff --git a/crates/core/src/kernel/mod.rs b/crates/core/src/kernel/mod.rs
+index 0050499..7108e8e 100644
+--- a/crates/core/src/kernel/mod.rs
++++ b/crates/core/src/kernel/mod.rs
+@@ -12,6 +12,8 @@ pub mod arrow;
+ pub mod error;
+ /// Core Delta log action models (Add, Remove, Metadata, Protocol, ...) and related types.
+ pub mod models;
++/// Native row tracking allocation and validation.
++pub mod row_tracking;
+ pub mod scalars;
+ /// Delta and Arrow schema types, conversions, casting and partition handling.
+ pub mod schema;
+diff --git a/crates/core/src/kernel/models/actions.rs b/crates/core/src/kernel/models/actions.rs
+index 5f31b16..ab79d6b 100644
+--- a/crates/core/src/kernel/models/actions.rs
++++ b/crates/core/src/kernel/models/actions.rs
+@@ -613,6 +613,23 @@ impl ProtocolInner {
+             }
+         }
+ 
++        if let Some(enable_row_tracking) = parsed_properties.get(&TableProperty::EnableRowTracking) {
++            match enable_row_tracking.to_ascii_lowercase().parse::<bool>() {
++                Ok(true) => {
++                    let features = self.writer_features.get_or_insert_with(HashSet::new);
++                    features.insert(TableFeature::RowTracking);
++                    features.insert(TableFeature::DomainMetadata);
++                    self.min_writer_version = 7;
++                }
++                Ok(false) => {}
++                Err(_) => {
++                    return Err(Error::Generic(format!(
++                        "delta.enableRowTracking = '{enable_row_tracking}' is invalid, valid values are ['true', 'false']"
++                    )));
++                }
++            }
++        }
++
+         // If the minWriterVersion has been set to 7 then there are additional writer features
+         // which must be applied
+         if self.min_writer_version >= 7
+diff --git a/crates/core/src/kernel/row_tracking.rs b/crates/core/src/kernel/row_tracking.rs
+new file mode 100644
+index 0000000..a4472d1
+--- /dev/null
++++ b/crates/core/src/kernel/row_tracking.rs
+@@ -0,0 +1,736 @@
++//! Protocol allocation and validation for native stable row tracking.
++
++use std::collections::HashMap;
++use std::time::{Duration, Instant};
++
++use delta_kernel::table_features::TableFeature;
++use delta_kernel::table_properties::TableProperties;
++use futures::TryStreamExt;
++use object_store::{ObjectStore as _, ObjectStoreExt as _};
++use serde::Deserialize;
++
++use crate::errors::{DeltaResult, DeltaTableError};
++use crate::kernel::{
++    Action, ActiveAddOptions, Add, AddStatsPolicy, DomainMetadata, EagerSnapshot, Metadata,
++    MetadataExt as _, Protocol, ProtocolInner, Version,
++};
++use crate::logstore::{LogStore, get_actions};
++use crate::protocol::checkpoints::parse_last_checkpoint_hint;
++
++/// Public stable row identity output column.
++pub const ROW_ID_COLUMN: &str = "__delta_row_id";
++/// Public last-update version output column.
++pub const ROW_COMMIT_VERSION_COLUMN: &str = "__delta_row_commit_version";
++/// Domain storing the committed allocation high-water mark.
++pub const ROW_TRACKING_DOMAIN: &str = "delta.rowTracking";
++/// Property enabling stable identity preservation.
++pub const ENABLE_ROW_TRACKING: &str = "delta.enableRowTracking";
++/// Unsupported suspension property.
++pub const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
++/// Property naming the physical materialized identity column.
++pub const MATERIALIZED_ROW_ID_COLUMN: &str = "delta.rowTracking.materializedRowIdColumnName";
++/// Property naming the physical materialized version column.
++pub const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN: &str =
++    "delta.rowTracking.materializedRowCommitVersionColumnName";
++/// Opt-in directory for documented deterministic commit barriers.
++pub const FAILPOINT_ENV: &str = "DELTALAKE_ROW_TRACKING_FAILPOINT_DIR";
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct RowTrackingDomainConfiguration {
++    row_id_high_water_mark: i64,
++}
++
++fn invalid(message: impl Into<String>) -> DeltaTableError {
++    DeltaTableError::InvalidData {
++        message: message.into(),
++    }
++}
++
++pub(crate) fn is_supported(protocol: &Protocol) -> bool {
++    protocol
++        .writer_features()
++        .is_some_and(|features| features.contains(&TableFeature::RowTracking))
++}
++
++pub(crate) fn is_enabled(properties: &TableProperties) -> bool {
++    properties.enable_row_tracking == Some(true)
++}
++
++pub(crate) fn materialized_column_names(properties: &TableProperties) -> DeltaResult<(&str, &str)> {
++    let row_id = properties
++        .materialized_row_id_column_name
++        .as_deref()
++        .ok_or_else(|| invalid("row tracking has no materialized row ID column name"))?;
++    let version = properties
++        .materialized_row_commit_version_column_name
++        .as_deref()
++        .ok_or_else(|| {
++            invalid("row tracking has no materialized row commit version column name")
++        })?;
++    if row_id.is_empty() || version.is_empty() || row_id == version {
++        return Err(invalid(
++            "row tracking materialized column names must be nonempty and distinct",
++        ));
++    }
++    Ok((row_id, version))
++}
++
++fn validate_schema(metadata: &Metadata) -> DeltaResult<()> {
++    let schema = metadata.parse_schema()?;
++    let configured: Vec<&str> = [
++        MATERIALIZED_ROW_ID_COLUMN,
++        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN,
++    ]
++    .iter()
++    .filter_map(|key| metadata.configuration().get(*key).map(String::as_str))
++    .collect();
++    for field in schema.fields() {
++        let logical = field.name().as_str();
++        if [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN].contains(&logical) {
++            return Err(invalid(format!(
++                "user column '{logical}' is reserved for row tracking"
++            )));
++        }
++        let physical = match field.metadata().get("delta.columnMapping.physicalName") {
++            Some(delta_kernel::schema::MetadataValue::String(name)) => Some(name.as_str()),
++            _ => None,
++        };
++        if configured
++            .iter()
++            .any(|name| *name == logical || Some(*name) == physical)
++        {
++            return Err(invalid(format!(
++                "materialized row tracking column collides with user column '{logical}'"
++            )));
++        }
++    }
++    Ok(())
++}
++
++pub(crate) fn enablement_actions(
++    protocol: &Protocol,
++    metadata: &Metadata,
++) -> DeltaResult<(Protocol, Metadata)> {
++    validate_schema(metadata)?;
++    let protocol = ProtocolInner::from_kernel(protocol)
++        .append_writer_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
++        .as_kernel();
++    let mut metadata = metadata
++        .clone()
++        .add_config_key(ENABLE_ROW_TRACKING.to_owned(), "true".to_owned())?;
++    if !metadata
++        .configuration()
++        .contains_key(MATERIALIZED_ROW_ID_COLUMN)
++    {
++        metadata = metadata.add_config_key(
++            MATERIALIZED_ROW_ID_COLUMN.to_owned(),
++            format!("_row_id_{}", uuid::Uuid::new_v4().simple()),
++        )?;
++    }
++    if !metadata
++        .configuration()
++        .contains_key(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN)
++    {
++        metadata = metadata.add_config_key(
++            MATERIALIZED_ROW_COMMIT_VERSION_COLUMN.to_owned(),
++            format!("_row_commit_version_{}", uuid::Uuid::new_v4().simple()),
++        )?;
++    }
++    Ok((protocol, metadata))
++}
++
++fn configured_bool(metadata: &Metadata, key: &str) -> DeltaResult<Option<bool>> {
++    metadata
++        .configuration()
++        .get(key)
++        .map(|value| {
++            value
++                .parse::<bool>()
++                .map_err(|_| invalid(format!("invalid boolean value for {key}: {value}")))
++        })
++        .transpose()
++}
++
++fn metadata_with_names(snapshot: Option<&EagerSnapshot>, actions: &[Action]) -> Option<Metadata> {
++    actions
++        .iter()
++        .rev()
++        .find_map(|action| match action {
++            Action::Metadata(metadata) => Some(metadata.clone()),
++            _ => None,
++        })
++        .or_else(|| snapshot.map(|snapshot| snapshot.metadata().clone()))
++}
++
++fn protocol_with_features(
++    snapshot: Option<&EagerSnapshot>,
++    actions: &[Action],
++) -> Option<Protocol> {
++    actions
++        .iter()
++        .rev()
++        .find_map(|action| match action {
++            Action::Protocol(protocol) => Some(protocol.clone()),
++            _ => None,
++        })
++        .or_else(|| snapshot.map(|snapshot| snapshot.protocol().clone()))
++}
++
++fn num_records(add: &Add) -> DeltaResult<Option<i64>> {
++    let Some(stats) = &add.stats else {
++        return Ok(None);
++    };
++    let stats: serde_json::Value = serde_json::from_str(stats)
++        .map_err(|err| invalid(format!("invalid Add statistics for row tracking: {err}")))?;
++    stats
++        .get("numRecords")
++        .map(|value| {
++            value
++                .as_i64()
++                .filter(|count| *count >= 0)
++                .ok_or_else(|| invalid("Add numRecords must be a nonnegative Int64"))
++        })
++        .transpose()
++}
++
++async fn records_for_allocation(add: &Add, log_store: &dyn LogStore) -> DeltaResult<i64> {
++    if let Some(count) = num_records(add)? {
++        return Ok(count);
++    }
++    let path = object_store::path::Path::parse(&add.path)?;
++    let reader =
++        crate::logstore::parquet_reader::ParquetObjectReader::new(log_store.object_store(), path);
++    let builder =
++        parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await?;
++    let count = builder.metadata().file_metadata().num_rows();
++    if count < 0 {
++        return Err(invalid("negative Parquet row count"));
++    }
++    Ok(count)
++}
++
++fn advance_high_water_mark(hwm: &mut i64, count: i64) -> DeltaResult<()> {
++    *hwm = hwm
++        .checked_add(count)
++        .ok_or_else(|| invalid("row ID high-water mark overflow"))?;
++    Ok(())
++}
++
++async fn backfill_active_files(
++    snapshot: &EagerSnapshot,
++    log_store: &dyn LogStore,
++    actions: &mut Vec<Action>,
++) -> DeltaResult<()> {
++    let mut add_indices = HashMap::new();
++    for (index, action) in actions.iter().enumerate() {
++        if let Action::Add(add) = action {
++            add_indices.insert(add.path.clone(), index);
++        }
++    }
++
++    let active_files = snapshot
++        .snapshot()
++        .active_adds(
++            log_store,
++            ActiveAddOptions {
++                predicate: None,
++                stats: AddStatsPolicy::RawJson,
++            },
++        )
++        .try_collect::<Vec<_>>()
++        .await?;
++    for file in active_files {
++        let mut file_add = file.to_add();
++        if file_add.base_row_id.is_some() && file_add.default_row_commit_version.is_some() {
++            continue;
++        }
++        if let Some(index) = add_indices.get(&file_add.path).copied() {
++            let Action::Add(add) = &mut actions[index] else {
++                unreachable!("Add index must reference an Add action")
++            };
++            add.data_change = false;
++        } else {
++            file_add.data_change = false;
++            actions.push(Action::Add(file_add));
++        }
++    }
++    Ok(())
++}
++
++async fn last_checkpoint_version(log_store: &dyn LogStore) -> DeltaResult<Option<Version>> {
++    let path = log_store.log_path().clone().join("_last_checkpoint");
++    let data = match log_store.object_store().get(&path).await {
++        Ok(data) => data.bytes().await?,
++        Err(object_store::Error::NotFound { .. }) => return Ok(None),
++        Err(err) => return Err(err.into()),
++    };
++    Ok(parse_last_checkpoint_hint(&data).map(|hint| hint.version))
++}
++
++/// Read the latest committed configuration for a system-controlled (`delta.*`) domain.
++///
++/// The kernel's public domain accessor rejects system domains, so the committed
++/// state is replayed here: JSON commits are scanned from the snapshot version
++/// back to the last checkpoint, whose parquet parts hold the surviving entries.
++async fn committed_domain_configuration(
++    snapshot: &EagerSnapshot,
++    log_store: &dyn LogStore,
++    domain: &str,
++) -> DeltaResult<Option<String>> {
++    let checkpoint_version = last_checkpoint_version(log_store).await?;
++    let mut cursor = snapshot.version();
++    loop {
++        if checkpoint_version.is_some_and(|version| cursor <= version) {
++            break;
++        }
++        if let Some(bytes) = log_store.read_commit_entry(cursor).await? {
++            let mut configuration = None;
++            for action in get_actions(cursor, &bytes)? {
++                if let Action::DomainMetadata(action) = action {
++                    if action.domain == domain {
++                        configuration = Some((!action.removed).then_some(action.configuration));
++                    }
++                }
++            }
++            if let Some(configuration) = configuration {
++                return Ok(configuration);
++            }
++        }
++        if cursor == 0 {
++            return Ok(None);
++        }
++        cursor -= 1;
++    }
++    match checkpoint_version {
++        Some(version) => checkpoint_domain_configuration(log_store, version, domain).await,
++        None => Ok(None),
++    }
++}
++
++async fn checkpoint_domain_configuration(
++    log_store: &dyn LogStore,
++    version: Version,
++    domain: &str,
++) -> DeltaResult<Option<String>> {
++    use arrow_array::{Array as _, BooleanArray, StringArray, StructArray};
++
++    let prefix = format!("{version:020}.checkpoint.");
++    let log_path = log_store.log_path().clone();
++    let mut parts: Vec<_> = log_store
++        .object_store()
++        .list(Some(&log_path))
++        .try_filter_map(|meta| {
++            let name = meta.location.filename().unwrap_or_default().to_owned();
++            std::future::ready(Ok(
++                (name.starts_with(&prefix) && name.ends_with(".parquet"))
++                    .then_some(meta.location),
++            ))
++        })
++        .try_collect()
++        .await?;
++    parts.sort();
++    for part in parts {
++        let reader =
++            crate::logstore::parquet_reader::ParquetObjectReader::new(log_store.object_store(), part);
++        let stream = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
++            .await?
++            .build()?;
++        let batches = stream.try_collect::<Vec<_>>().await?;
++        for batch in batches {
++            let Some(column) = batch.column_by_name("domainMetadata") else {
++                continue;
++            };
++            let Some(entries) = column.as_any().downcast_ref::<StructArray>() else {
++                continue;
++            };
++            let domains = entries
++                .column_by_name("domain")
++                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
++            let configurations = entries
++                .column_by_name("configuration")
++                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
++            let removed = entries
++                .column_by_name("removed")
++                .and_then(|column| column.as_any().downcast_ref::<BooleanArray>());
++            let (Some(domains), Some(configurations), Some(removed)) =
++                (domains, configurations, removed)
++            else {
++                continue;
++            };
++            for row in 0..entries.len() {
++                if entries.is_null(row) || removed.value(row) {
++                    continue;
++                }
++                if domains.value(row) == domain {
++                    return Ok(Some(configurations.value(row).to_owned()));
++                }
++            }
++        }
++    }
++    Ok(None)
++}
++
++pub(crate) async fn prepare_commit_actions(
++    snapshot: Option<&EagerSnapshot>,
++    log_store: &dyn LogStore,
++    actions: &mut Vec<Action>,
++    version: Version,
++) -> DeltaResult<bool> {
++    let protocol = protocol_with_features(snapshot, actions);
++    let metadata = metadata_with_names(snapshot, actions);
++    let supported_before = snapshot.is_some_and(|snapshot| is_supported(snapshot.protocol()));
++    let supported_after = protocol.as_ref().is_some_and(is_supported);
++    if supported_before && !supported_after {
++        return Err(invalid("dropping row tracking is not supported"));
++    }
++
++    let enabled_before = snapshot.is_some_and(|snapshot| is_enabled(snapshot.table_properties()));
++    let enabled_after = match &metadata {
++        Some(metadata) => configured_bool(metadata, ENABLE_ROW_TRACKING)?.unwrap_or(enabled_before),
++        None => enabled_before,
++    };
++    if enabled_before && !enabled_after {
++        return Err(invalid("disabling row tracking is not supported"));
++    }
++
++    let suspended_after = match &metadata {
++        Some(metadata) => configured_bool(metadata, ROW_TRACKING_SUSPENDED)?.unwrap_or(false),
++        None => false,
++    };
++    if suspended_after {
++        return Err(invalid("suspending row tracking is not supported"));
++    }
++    if !supported_after {
++        return Ok(false);
++    }
++    if let Some(protocol) = &protocol {
++        if protocol.min_writer_version() != 7
++            || !protocol
++                .writer_features()
++                .is_some_and(|features| features.contains(&TableFeature::DomainMetadata))
++        {
++            return Err(invalid(
++                "row tracking requires writer version 7 and domainMetadata",
++            ));
++        }
++    }
++    if enabled_before {
++        if let (Some(snapshot), Some(metadata)) = (snapshot, metadata.as_ref()) {
++            for property in [
++                MATERIALIZED_ROW_ID_COLUMN,
++                MATERIALIZED_ROW_COMMIT_VERSION_COLUMN,
++            ] {
++                if snapshot.metadata().configuration().get(property)
++                    != metadata.configuration().get(property)
++                {
++                    return Err(invalid(
++                        "materialized row tracking column names are immutable",
++                    ));
++                }
++            }
++        }
++    }
++    if enabled_after {
++        let metadata = metadata
++            .as_ref()
++            .ok_or_else(|| invalid("row tracking enablement requires table metadata"))?;
++        validate_schema(metadata)?;
++        if !enabled_before {
++            let properties = snapshot
++                .map(|snapshot| snapshot.table_properties().clone())
++                .unwrap_or_default();
++            materialized_column_names(&properties).or_else(|_| {
++                let row_id = metadata
++                    .configuration()
++                    .get(MATERIALIZED_ROW_ID_COLUMN)
++                    .map(String::as_str);
++                let version = metadata
++                    .configuration()
++                    .get(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN)
++                    .map(String::as_str);
++                match (row_id, version) {
++                    (Some(row_id), Some(version))
++                        if !row_id.is_empty() && !version.is_empty() && row_id != version =>
++                    {
++                        Ok((row_id, version))
++                    }
++                    _ => Err(invalid(
++                        "row tracking enablement requires distinct materialized column names",
++                    )),
++                }
++            })?;
++        }
++    }
++
++    if enabled_after && !enabled_before {
++        if let Some(snapshot) = snapshot {
++            backfill_active_files(snapshot, log_store, actions).await?;
++        }
++    }
++
++    let domain_configuration = match snapshot {
++        Some(snapshot) => {
++            committed_domain_configuration(snapshot, log_store, ROW_TRACKING_DOMAIN).await?
++        }
++        None => None,
++    };
++    let domain_present = domain_configuration.is_some();
++    let mut previous_hwm = domain_configuration
++        .map(|configuration| {
++            serde_json::from_str::<RowTrackingDomainConfiguration>(&configuration)
++                .map(|domain| domain.row_id_high_water_mark)
++                .map_err(|err| invalid(format!("invalid row tracking domain metadata: {err}")))
++        })
++        .transpose()?
++        .unwrap_or(-1);
++    if previous_hwm < -1 {
++        return Err(invalid("row ID high-water mark is below -1"));
++    }
++    let initial_hwm = previous_hwm;
++    let commit_version = i64::try_from(version)
++        .map_err(|_| invalid("commit version does not fit the row commit version type"))?;
++    let had_domain_action = actions
++        .iter()
++        .any(|action| matches!(action, Action::DomainMetadata(domain) if domain.domain == ROW_TRACKING_DOMAIN));
++    actions.retain(|action| {
++        !matches!(action, Action::DomainMetadata(domain) if domain.domain == ROW_TRACKING_DOMAIN)
++    });
++
++    for action in actions.iter_mut() {
++        let Action::Add(add) = action else {
++            continue;
++        };
++        let count = num_records(add)?;
++        if add.base_row_id.is_some_and(|base| base < 0) {
++            return Err(invalid("baseRowId must be nonnegative"));
++        }
++        if add.base_row_id.is_none() {
++            let count = match count {
++                Some(count) => count,
++                None => records_for_allocation(add, log_store).await?,
++            };
++            let base = previous_hwm
++                .checked_add(1)
++                .ok_or_else(|| invalid("row ID high-water mark overflow"))?;
++            add.base_row_id = Some(base);
++            advance_high_water_mark(&mut previous_hwm, count)?;
++        } else if let (Some(base), Some(count)) = (add.base_row_id, count) {
++            if count > 0 {
++                let highest = base
++                    .checked_add(count - 1)
++                    .ok_or_else(|| invalid("row ID range overflow"))?;
++                previous_hwm = previous_hwm.max(highest);
++            }
++        }
++        if add.default_row_commit_version.is_none() {
++            add.default_row_commit_version = Some(commit_version);
++        }
++    }
++
++    if previous_hwm != initial_hwm || !domain_present || had_domain_action {
++        actions.push(Action::DomainMetadata(DomainMetadata {
++            domain: ROW_TRACKING_DOMAIN.to_owned(),
++            configuration: format!("{{\"rowIdHighWaterMark\":{previous_hwm}}}"),
++            removed: false,
++        }));
++    }
++    Ok(true)
++}
++
++pub(crate) async fn commit_failpoint(
++    phase: &str,
++    version: Version,
++    attempt: usize,
++) -> DeltaResult<()> {
++    let Ok(root) = std::env::var(FAILPOINT_ENV) else {
++        return Ok(());
++    };
++    let root = std::path::PathBuf::from(root);
++    std::fs::create_dir_all(&root)?;
++    let stem = format!("{phase}-{version:020}-{attempt:02}");
++    std::fs::write(root.join(format!("{stem}.ready")), b"")?;
++    let release = root.join(format!("{stem}.release"));
++    let deadline = Instant::now() + Duration::from_secs(60);
++    while !release.exists() {
++        if Instant::now() >= deadline {
++            return Err(invalid(format!(
++                "timed out waiting for row tracking failpoint release {}",
++                release.display()
++            )));
++        }
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::future::IntoFuture;
++
++    #[test]
++    fn allocation_overflow_is_atomic() {
++        let mut mark = i64::MAX - 1;
++        assert!(advance_high_water_mark(&mut mark, 2).is_err());
++        assert_eq!(mark, i64::MAX - 1);
++        advance_high_water_mark(&mut mark, 1).unwrap();
++        assert_eq!(mark, i64::MAX);
++    }
++
++    #[cfg(feature = "datafusion")]
++    #[tokio::test]
++    async fn high_water_mark_survives_checkpoint_replay() -> DeltaResult<()> {
++        use arrow_array::{Int64Array, RecordBatch};
++        use arrow_schema::{DataType, Field, Schema};
++        use std::sync::Arc;
++        let batch = || {
++            RecordBatch::try_new(
++                Arc::new(Schema::new(vec![Field::new(
++                    "value",
++                    DataType::Int64,
++                    false,
++                )])),
++                vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
++            )
++        };
++        let table = crate::DeltaTable::new_in_memory()
++            .write(vec![batch()?])
++            .await?
++            .enable_row_tracking()
++            .await?;
++        crate::protocol::checkpoints::create_checkpoint_for(
++            table.version().unwrap(),
++            table.log_store().as_ref(),
++        )
++        .await?;
++        let table = table.write(vec![batch()?]).await?;
++        let adds = table
++            .snapshot()?
++            .snapshot()
++            .snapshot()
++            .active_adds(
++                table.log_store().as_ref(),
++                ActiveAddOptions {
++                    predicate: None,
++                    stats: AddStatsPolicy::RawJson,
++                },
++            )
++            .try_collect::<Vec<_>>()
++            .await?;
++        let mut bases: Vec<i64> = adds
++            .iter()
++            .map(|file| file.to_add().base_row_id.expect("committed base"))
++            .collect();
++        bases.sort_unstable();
++        assert_eq!(bases, vec![0, 3]);
++        let configuration = committed_domain_configuration(
++            table.snapshot()?.snapshot(),
++            table.log_store().as_ref(),
++            ROW_TRACKING_DOMAIN,
++        )
++        .await?
++        .expect("row tracking domain");
++        assert_eq!(configuration, "{\"rowIdHighWaterMark\":5}");
++        Ok(())
++    }
++
++    #[cfg(feature = "datafusion")]
++    #[tokio::test]
++    async fn concurrent_appends_use_distinct_committed_ranges() -> DeltaResult<()> {
++        use arrow_array::{Int64Array, RecordBatch};
++        use arrow_schema::{DataType, Field, Schema};
++        use std::sync::Arc;
++        let batch = RecordBatch::try_new(
++            Arc::new(Schema::new(vec![Field::new(
++                "value",
++                DataType::Int64,
++                false,
++            )])),
++            vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
++        )?;
++        let table = crate::DeltaTable::new_in_memory()
++            .write(vec![batch.clone()])
++            .await?
++            .enable_row_tracking()
++            .await?;
++        let left = table.clone().write(vec![batch.clone()]);
++        let right = table.clone().write(vec![batch]);
++        let (left, right) = tokio::join!(left.into_future(), right.into_future());
++        let left = left?;
++        let right = right?;
++        assert_ne!(left.version(), right.version());
++        let mut table = table;
++        table.load().await?;
++        let adds = table
++            .snapshot()?
++            .snapshot()
++            .snapshot()
++            .active_adds(
++                table.log_store().as_ref(),
++                ActiveAddOptions {
++                    predicate: None,
++                    stats: AddStatsPolicy::RawJson,
++                },
++            )
++            .try_collect::<Vec<_>>()
++            .await?;
++        let mut ids = std::collections::HashSet::new();
++        let mut versions = std::collections::HashSet::new();
++        for file in adds {
++            let add = file.to_add();
++            let base = add.base_row_id.expect("committed base");
++            versions.insert(add.default_row_commit_version.expect("committed version"));
++            for offset in 0..num_records(&add)?.expect("statistics") {
++                assert!(ids.insert(base + offset), "committed ID ranges overlap");
++            }
++        }
++        assert_eq!(ids.len(), 9);
++        assert_eq!(versions.len(), 3);
++        Ok(())
++    }
++
++    #[cfg(feature = "datafusion")]
++    #[tokio::test]
++    async fn enable_backfill_and_idempotence() -> DeltaResult<()> {
++        use arrow_array::{Int64Array, RecordBatch};
++        use arrow_schema::{DataType, Field, Schema};
++        use std::sync::Arc;
++        let batch = RecordBatch::try_new(
++            Arc::new(Schema::new(vec![Field::new(
++                "value",
++                DataType::Int64,
++                false,
++            )])),
++            vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
++        )?;
++        let table = crate::DeltaTable::new_in_memory()
++            .write(vec![batch])
++            .await?;
++        let table = table.enable_row_tracking().await?;
++        let version = table.version();
++        let snapshot = table.snapshot()?;
++        assert!(is_enabled(snapshot.snapshot().table_properties()));
++        let adds = snapshot
++            .snapshot()
++            .snapshot()
++            .active_adds(
++                table.log_store().as_ref(),
++                ActiveAddOptions {
++                    predicate: None,
++                    stats: AddStatsPolicy::RawJson,
++                },
++            )
++            .try_collect::<Vec<_>>()
++            .await?;
++        assert_eq!(adds.len(), 1);
++        assert!(adds[0].to_add().base_row_id.is_some());
++        assert_eq!(
++            adds[0].to_add().default_row_commit_version,
++            version.map(|version| version as i64)
++        );
++        let table = table.enable_row_tracking().await?;
++        assert_eq!(table.version(), version);
++        Ok(())
++    }
++}
+diff --git a/crates/core/src/kernel/snapshot/iterators.rs b/crates/core/src/kernel/snapshot/iterators.rs
+index ff12719..71a49f5 100644
+--- a/crates/core/src/kernel/snapshot/iterators.rs
++++ b/crates/core/src/kernel/snapshot/iterators.rs
+@@ -389,8 +389,9 @@ impl LogicalFileView {
+             partition_values: Some(self.partition_values_map()),
+             deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
+             tags: None,
+-            base_row_id: None,
+-            default_row_commit_version: None,
++            base_row_id: self.file_constant_i64(FIELD_NAME_BASE_ROW_ID),
++            default_row_commit_version: self
++                .file_constant_i64(FIELD_NAME_DEFAULT_ROW_COMMIT_VERSION),
+         }
+     }
+ }
+diff --git a/crates/core/src/kernel/transaction/mod.rs b/crates/core/src/kernel/transaction/mod.rs
+index a133d69..938b0cb 100644
+--- a/crates/core/src/kernel/transaction/mod.rs
++++ b/crates/core/src/kernel/transaction/mod.rs
+@@ -299,7 +299,7 @@ impl TableReference for DeltaTableState {
+ }
+ 
+ /// Data that was actually written to the log store.
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct CommitData {
+     /// The actions
+     pub actions: Vec<Action>,
+@@ -535,6 +535,27 @@ impl CommitData {
+     }
+ }
+ 
++async fn prepare_row_tracking_payload(
++    data: &CommitData,
++    committer: &dyn Committer,
++    store: ObjectStoreRef,
++    retries: u64,
++) -> DeltaResult<CommitOrBytes> {
++    let mut bytes = data.get_bytes()?;
++    if retries > 0 {
++        bytes = CommitData::update_retry_count_in_bytes(&bytes, retries)?;
++    }
++    match committer.payload_kind() {
++        PayloadKind::Bytes => Ok(CommitOrBytes::LogBytes(bytes)),
++        PayloadKind::TmpCommit => {
++            let token = uuid::Uuid::new_v4().to_string();
++            let path = Path::from_iter([DELTA_LOG_FOLDER, &format!("_commit_{token}.json.tmp")]);
++            store.put(&path, bytes.into()).await?;
++            Ok(CommitOrBytes::TmpCommit(path))
++        }
++    }
++}
++
+ #[derive(Clone, Debug, Copy)]
+ /// Properties for post commit hook.
+ pub struct PostCommitHookProperties {
+@@ -809,23 +830,48 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+             let max_retries = this.max_retries;
+             let read_files = this.read_files;
+ 
+-            // The version of the most recent commit attempt. Every non-success exit aborts that
+-            // attempt so that temporary commit files and staged commit entries do not leak.
+             let mut attempted_version: Version = 0;
++            let mut last_attempt_payload: Option<CommitOrBytes> = None;
+ 
+             let result: DeltaResult<PostCommit> = async {
+                 let mut attempt_number: usize = 1;
+ 
+-                // Handle the case where table doesn't exist yet (initial table creation)
+                 let read_snapshot: EagerSnapshot = if let Some(table_data) = this.table_data {
+                     table_data.eager_snapshot().clone()
+                 } else {
+                     debug!("committing initial table version 0");
+-                    match committer.commit(0, commit_or_bytes.clone()).await {
++                    let mut attempt_data = data.clone();
++                    let tracked = crate::kernel::row_tracking::prepare_commit_actions(
++                        None,
++                        log_store.as_ref(),
++                        &mut attempt_data.actions,
++                        0,
++                    )
++                    .await?;
++                    let payload = if tracked {
++                        prepare_row_tracking_payload(
++                            &attempt_data,
++                            committer.as_ref(),
++                            log_store.object_store(),
++                            0,
++                        )
++                        .await?
++                    } else {
++                        commit_or_bytes.clone()
++                    };
++                    last_attempt_payload = Some(payload.clone());
++                    if tracked {
++                        crate::kernel::row_tracking::commit_failpoint("before", 0, 1).await?;
++                    }
++                    match committer.commit(0, payload).await {
+                         Ok(CommitResponse::Committed) => {
++                            if tracked {
++                                crate::kernel::row_tracking::commit_failpoint("after", 0, 1)
++                                    .await?;
++                            }
+                             return Ok(PostCommit {
+                                 version: 0,
+-                                data,
++                                data: attempt_data,
+                                 create_checkpoint: false,
+                                 cleanup_expired_logs: None,
+                                 log_store,
+@@ -835,8 +881,6 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                         }
+                         Ok(CommitResponse::Conflict { .. })
+                         | Err(TransactionError::VersionAlreadyExists(_)) => {
+-                            // Table was created by another writer since the `table_data.is_none()`
+-                            // check. Load the current table state and continue with the retry loop.
+                             debug!("version 0 already exists, loading table state for retry");
+                             attempt_number = 2;
+                             let latest_version: Version = log_store.get_latest_version(0).await?;
+@@ -866,8 +910,6 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                             .await?;
+ 
+                         if latest_version > read_snapshot.version() {
+-                            // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
+-                            // and throw immediately
+                             if max_retries == 0 {
+                                 warn!(
+                                     base_version = read_snapshot.version(),
+@@ -888,8 +930,6 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                             let mut steps = latest_version - read_snapshot.version();
+                             let mut conflicts_checked = 0;
+ 
+-                            // Need to check for conflicts with each version between the read_snapshot and
+-                            // the latest!
+                             while steps != 0 {
+                                 conflicts_checked += 1;
+                                 let summary = WinningCommitSummary::try_new(
+@@ -933,7 +973,6 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                                 conflicts_checked = conflicts_checked,
+                                 "all conflicts resolved, updating snapshot"
+                             );
+-                            // Update snapshot to latest version after successful conflict check
+                             read_snapshot
+                                 .update(&log_store, Some(latest_version))
+                                 .await?;
+@@ -942,28 +981,59 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                         attempted_version = version;
+                         Span::current().record("target_version", version);
+ 
+-                        // Calculate current retry count (attempt 1 = 0 retries, attempt 2 = 1 retry, etc.)
+                         let current_retries = (attempt_number - 1) as u64;
+-
+-                        // Update operationMetrics.numRetries in the serialized bytes
+-                        let updated_commit_or_bytes = match &commit_or_bytes {
+-                            CommitOrBytes::LogBytes(bytes) => {
+-                                let updated_bytes = if current_retries > 0 {
+-                                    CommitData::update_retry_count_in_bytes(bytes, current_retries)?
+-                                } else {
+-                                    bytes.clone()
+-                                };
+-                                CommitOrBytes::LogBytes(updated_bytes)
+-                            }
+-                            CommitOrBytes::TmpCommit(_path) => {
+-                                // For TmpCommit stores, keep original behavior for now
+-                                // (these stores write to tmp file first, then rename)
+-                                commit_or_bytes.clone()
++                        let mut attempt_data = data.clone();
++                        let tracked = crate::kernel::row_tracking::prepare_commit_actions(
++                            Some(&read_snapshot),
++                            log_store.as_ref(),
++                            &mut attempt_data.actions,
++                            version,
++                        )
++                        .await?;
++                        let updated_commit_or_bytes = if tracked {
++                            prepare_row_tracking_payload(
++                                &attempt_data,
++                                committer.as_ref(),
++                                log_store.object_store(),
++                                current_retries,
++                            )
++                            .await?
++                        } else {
++                            match &commit_or_bytes {
++                                CommitOrBytes::LogBytes(bytes) => {
++                                    let updated_bytes = if current_retries > 0 {
++                                        CommitData::update_retry_count_in_bytes(
++                                            bytes,
++                                            current_retries,
++                                        )?
++                                    } else {
++                                        bytes.clone()
++                                    };
++                                    CommitOrBytes::LogBytes(updated_bytes)
++                                }
++                                CommitOrBytes::TmpCommit(_) => commit_or_bytes.clone(),
+                             }
+                         };
++                        last_attempt_payload = Some(updated_commit_or_bytes.clone());
++                        if tracked {
++                            crate::kernel::row_tracking::commit_failpoint(
++                                "before",
++                                version,
++                                attempt_number,
++                            )
++                            .await?;
++                        }
+ 
+                         match committer.commit(version, updated_commit_or_bytes).await {
+                             Ok(CommitResponse::Committed) => {
++                                if tracked {
++                                    crate::kernel::row_tracking::commit_failpoint(
++                                        "after",
++                                        version,
++                                        attempt_number,
++                                    )
++                                    .await?;
++                                }
+                                 info!(
+                                     version = version,
+                                     num_retries = attempt_number - 1,
+@@ -971,7 +1041,7 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                                 );
+                                 return Ok(PostCommit {
+                                     version,
+-                                    data,
++                                    data: attempt_data,
+                                     create_checkpoint: post_commit
+                                         .map(|v| v.create_checkpoint)
+                                         .unwrap_or_default(),
+@@ -992,8 +1062,6 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+                                     attempt = attempt_number,
+                                     "version already exists, will retry"
+                                 );
+-                                // If the version already exists, loop through again and re-check
+-                                // conflicts
+                                 attempt_number += 1;
+                             }
+                             Err(err) => {
+@@ -1021,9 +1089,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
+             match result {
+                 Ok(post_commit) => Ok(post_commit),
+                 Err(err) => {
+-                    if let Err(abort_err) =
+-                        committer.abort(attempted_version, commit_or_bytes).await
+-                    {
++                    let payload = last_attempt_payload.unwrap_or(commit_or_bytes);
++                    if let Err(abort_err) = committer.abort(attempted_version, payload).await {
+                         warn!(error = %abort_err, "failed to abort commit attempt");
+                     }
+                     Err(err)
+diff --git a/crates/core/src/kernel/transaction/protocol.rs b/crates/core/src/kernel/transaction/protocol.rs
+index f2a9248..d43389e 100644
+--- a/crates/core/src/kernel/transaction/protocol.rs
++++ b/crates/core/src/kernel/transaction/protocol.rs
+@@ -338,6 +338,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
+         writer_features.insert(TableFeature::ColumnMapping);
+     }
+     writer_features.insert(TableFeature::DeletionVectors);
++    writer_features.insert(TableFeature::RowTracking);
++    writer_features.insert(TableFeature::DomainMetadata);
+     // writer_features.insert(TableFeature::IdentityColumns);
+     // `checkpointProtection` is a writer-only feature which constrains checkpoint
+     // creation and metadata cleanup, neither of which this crate performs when
+diff --git a/crates/core/src/operations/create.rs b/crates/core/src/operations/create.rs
+index a813b0a..c24a183 100644
+--- a/crates/core/src/operations/create.rs
++++ b/crates/core/src/operations/create.rs
+@@ -350,6 +350,15 @@ impl CreateBuilder {
+         if let Some(comment) = self.comment {
+             metadata = metadata.with_description(comment)?;
+         }
++        let (protocol, metadata) = if metadata
++            .configuration()
++            .get(crate::kernel::row_tracking::ENABLE_ROW_TRACKING)
++            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
++        {
++            crate::kernel::row_tracking::enablement_actions(&protocol, &metadata)?
++        } else {
++            (protocol, metadata)
++        };
+ 
+         let operation = DeltaOperation::Create {
+             mode: self.mode,
+diff --git a/crates/core/src/operations/delete.rs b/crates/core/src/operations/delete.rs
+index d5c268e..6725262 100644
+--- a/crates/core/src/operations/delete.rs
++++ b/crates/core/src/operations/delete.rs
+@@ -84,7 +84,7 @@ use crate::kernel::{
+ use crate::logstore::with_operation;
+ use crate::logstore::{LogStore, LogStoreRef};
+ use crate::operations::cdc::CDC_COLUMN_NAME;
+-use crate::operations::write::execution::write_exec_plan;
++use crate::operations::write::execution::{row_tracking_rewrite_scan, write_exec_plan};
+ use crate::protocol::DeltaOperation;
+ use crate::table::state::DeltaTableState;
+ 
+@@ -575,10 +575,12 @@ async fn execute(
+         .await?;
+     metrics.num_removed_files = removes.len();
+ 
++    let rewrite_scan =
++        row_tracking_rewrite_scan(session, snapshot, log_store.clone(), &files_scan)?;
+     let counted_scan = LogicalPlan::Extension(Extension {
+         node: Arc::new(MetricObserver {
+             id: SOURCE_COUNT_ID.into(),
+-            input: files_scan.scan().clone(),
++            input: rewrite_scan.clone(),
+             enable_pushdown: false,
+         }),
+     });
+@@ -600,9 +602,7 @@ async fn execute(
+ 
+     let (write_plan, write_cdc) = if should_write_cdc(&eager_snapshot)? {
+         // create change set entries for all records we deleted
+-        let cdc_deletes = files_scan
+-            .scan()
+-            .clone()
++        let cdc_deletes = rewrite_scan
+             .into_builder()
+             .filter(files_scan.predicate)?
+             .with_column(CDC_COLUMN_NAME, lit("delete"))?
+diff --git a/crates/core/src/operations/enable_row_tracking.rs b/crates/core/src/operations/enable_row_tracking.rs
+new file mode 100644
+index 0000000..7ec3c6e
+--- /dev/null
++++ b/crates/core/src/operations/enable_row_tracking.rs
+@@ -0,0 +1,65 @@
++//! Atomic enablement and metadata backfill for native row tracking.
++
++use futures::future::BoxFuture;
++
++use crate::kernel::row_tracking::{enablement_actions, is_enabled};
++use crate::kernel::transaction::CommitProperties;
++use crate::kernel::{EagerSnapshot, TableFeatures, resolve_snapshot};
++use crate::logstore::LogStoreRef;
++use crate::operations::commit_actions_in_scope;
++use crate::protocol::DeltaOperation;
++use crate::table::state::DeltaTableState;
++use crate::{DeltaResult, DeltaTable};
++
++/// Enables tracking without rewriting existing data files.
++pub struct EnableRowTrackingBuilder {
++    snapshot: Option<EagerSnapshot>,
++    log_store: LogStoreRef,
++    commit_properties: CommitProperties,
++}
++
++impl EnableRowTrackingBuilder {
++    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
++        Self {
++            snapshot,
++            log_store,
++            commit_properties: CommitProperties::default(),
++        }
++    }
++
++    /// Set transaction metadata and retry properties.
++    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
++        self.commit_properties = commit_properties;
++        self
++    }
++}
++
++impl std::future::IntoFuture for EnableRowTrackingBuilder {
++    type Output = DeltaResult<DeltaTable>;
++    type IntoFuture = BoxFuture<'static, Self::Output>;
++
++    fn into_future(self) -> Self::IntoFuture {
++        let this = self;
++        Box::pin(async move {
++            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
++            if is_enabled(snapshot.table_properties()) {
++                return Ok(DeltaTable::new_with_state(
++                    this.log_store,
++                    DeltaTableState::new(snapshot),
++                ));
++            }
++            let (protocol, metadata) =
++                enablement_actions(snapshot.protocol(), snapshot.metadata())?;
++            commit_actions_in_scope(
++                &this.log_store,
++                &snapshot,
++                this.commit_properties,
++                vec![protocol.into(), metadata.into()],
++                DeltaOperation::AddFeature {
++                    name: vec![TableFeatures::RowTracking, TableFeatures::DomainMetadata],
++                },
++            )
++            .await
++        })
++    }
++}
+diff --git a/crates/core/src/operations/load.rs b/crates/core/src/operations/load.rs
+index b3d7c5a..ea996b3 100644
+--- a/crates/core/src/operations/load.rs
++++ b/crates/core/src/operations/load.rs
+@@ -1,12 +1,14 @@
+ use std::sync::Arc;
+ 
+-use datafusion::catalog::Session;
++use datafusion::catalog::{Session, TableProvider};
+ use datafusion::physical_plan::SendableRecordBatchStream;
+ use futures::future::BoxFuture;
+ 
+ use crate::DeltaTable;
+ use crate::delta_datafusion::engine::AsObjectStoreUrl as _;
+-use crate::delta_datafusion::{DataFusionMixins as _, create_session};
++use crate::delta_datafusion::{
++    DataFusionMixins as _, DeltaScanConfig, DeltaScanNext, create_session,
++};
+ use crate::errors::DeltaResult;
+ use crate::kernel::transaction::PROTOCOL;
+ use crate::kernel::{EagerSnapshot, resolve_snapshot};
+@@ -21,6 +23,8 @@ pub struct LoadBuilder {
+     log_store: LogStoreRef,
+     /// A sub-selection of columns to be loaded
+     columns: Option<Vec<String>>,
++    /// Include stable row IDs and row commit versions.
++    include_row_tracking: bool,
+     /// Datafusion session state relevant for executing the input plan
+     session: Option<Arc<dyn Session>>,
+ }
+@@ -41,6 +45,7 @@ impl LoadBuilder {
+             snapshot,
+             log_store,
+             columns: None,
++            include_row_tracking: false,
+             session: None,
+         }
+     }
+@@ -51,6 +56,15 @@ impl LoadBuilder {
+         self
+     }
+ 
++    /// Append non-null Int64 row IDs and row commit versions to the selected user columns.
++    ///
++    /// Row tracking must be enabled on the snapshot. Missing or invalid persisted row
++    /// metadata produces an error; metadata is reconstructed before deletion vectors.
++    pub fn with_row_tracking(mut self, include: bool) -> Self {
++        self.include_row_tracking = include;
++        self
++    }
++
+     /// The Datafusion session state to use
+     pub fn with_session_state(mut self, session: Arc<dyn Session>) -> Self {
+         self.session = Some(session);
+@@ -67,13 +81,24 @@ impl std::future::IntoFuture for LoadBuilder {
+ 
+         Box::pin(async move {
+             let snapshot = resolve_snapshot(&this.log_store, this.snapshot, None).await?;
+-            PROTOCOL.can_read_from(&snapshot)?;
++            match PROTOCOL.can_read_from(&snapshot) {
++                Ok(()) => {}
++                Err(crate::kernel::transaction::TransactionError::UnsupportedTableFeatures(
++                    features,
++                )) if this.include_row_tracking
++                    && features.as_slice()
++                        == [delta_kernel::table_features::TableFeature::ColumnMapping]
++                    && snapshot
++                        .snapshot()
++                        .table_configuration()
++                        .is_feature_enabled(
++                            &delta_kernel::table_features::TableFeature::ColumnMapping,
++                        ) => {}
++                Err(error) => return Err(error.into()),
++            }
+ 
+             let schema = snapshot.read_schema();
+-            let projection = crate::datafile::datafusion_ext::projection_indices(
+-                &schema,
+-                this.columns.as_deref(),
+-            )?;
++            crate::datafile::datafusion_ext::projection_indices(&schema, this.columns.as_deref())?;
+ 
+             let session = if let Some(session) = this.session {
+                 session
+@@ -90,7 +115,32 @@ impl std::future::IntoFuture for LoadBuilder {
+             };
+ 
+             let table = DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot));
+-            let provider = table.table_provider().await?;
++            let provider: Arc<dyn TableProvider> = if this.include_row_tracking {
++                let config =
++                    DeltaScanConfig::new_from_session(session.as_ref()).with_row_tracking(true);
++                Arc::new(
++                    DeltaScanNext::new(table.snapshot()?.snapshot().clone(), config)?
++                        .with_log_store(table.log_store()),
++                )
++            } else {
++                table.table_provider().await?
++            };
++            // Resolve names against the provider: partition columns need not have the
++            // same order in the snapshot's Arrow schema and the logical scan schema.
++            let mut projection = crate::datafile::datafusion_ext::projection_indices(
++                &provider.schema(),
++                this.columns.as_deref(),
++            )?;
++            if this.include_row_tracking
++                && let Some(projection) = &mut projection
++            {
++                let provider_schema = provider.schema();
++                projection.extend([
++                    provider_schema.index_of(crate::kernel::row_tracking::ROW_ID_COLUMN)?,
++                    provider_schema
++                        .index_of(crate::kernel::row_tracking::ROW_COMMIT_VERSION_COLUMN)?,
++                ]);
++            }
+             let stream = crate::datafile::datafusion_ext::coalesce_provider_scan(
+                 &provider,
+                 session.as_ref(),
+@@ -208,4 +258,121 @@ mod tests {
+         assert_batches_sorted_eq!(&expected, &data);
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn test_native_row_tracking_projection_and_filter() -> TestResult {
++        use crate::delta_datafusion::{DeltaScanConfig, DeltaScanNext, create_session};
++        use crate::kernel::row_tracking::{ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
++        use arrow::{
++            array::Int64Array,
++            datatypes::{DataType, Field, Schema},
++            record_batch::RecordBatch,
++        };
++        use std::{collections::HashSet, sync::Arc};
++
++        let batch = RecordBatch::try_new(
++            Arc::new(Schema::new(vec![Field::new(
++                "value",
++                DataType::Int64,
++                false,
++            )])),
++            vec![Arc::new(Int64Array::from(vec![3, 3, 5]))],
++        )?;
++        let table = DeltaTable::new_in_memory().write(vec![batch]).await?;
++        assert!(table.scan_table().with_row_tracking(true).await.is_err());
++        let table = table.enable_row_tracking().await?;
++        let version = table.version().unwrap() as i64;
++        let (_, stream) = table
++            .scan_table()
++            .with_columns(["value"])
++            .with_row_tracking(true)
++            .await?;
++        let schema = stream.schema();
++        assert_eq!(
++            schema
++                .fields()
++                .iter()
++                .map(|field| field.name().as_str())
++                .collect::<Vec<_>>(),
++            vec!["value", ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN]
++        );
++        for name in [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN] {
++            let field = schema.field_with_name(name)?;
++            assert_eq!(field.data_type(), &DataType::Int64);
++            assert!(!field.is_nullable());
++        }
++        let batches = collect_sendable_stream(stream).await?;
++        let mut ids = HashSet::new();
++        let mut id_of_five = None;
++        for batch in batches {
++            let values = batch
++                .column(0)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap();
++            let row_ids = batch
++                .column(1)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap();
++            let versions = batch
++                .column(2)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .unwrap();
++            for index in 0..batch.num_rows() {
++                assert!(row_ids.value(index) >= 0);
++                assert!(ids.insert(row_ids.value(index)));
++                assert_eq!(versions.value(index), version);
++                if values.value(index) == 5 {
++                    id_of_five = Some(row_ids.value(index));
++                }
++            }
++        }
++        assert_eq!(ids.len(), 3);
++        let (_, stream) = table
++            .scan_table()
++            .with_columns(Vec::<String>::new())
++            .with_row_tracking(true)
++            .await?;
++        assert_eq!(stream.schema().fields().len(), 2);
++        assert_eq!(
++            collect_sendable_stream(stream)
++                .await?
++                .iter()
++                .map(|batch| batch.num_rows())
++                .sum::<usize>(),
++            3
++        );
++        let (_, stream) = table.scan_table().await?;
++        assert_eq!(stream.schema().fields().len(), 1);
++
++        let provider = DeltaScanNext::new(
++            table.snapshot()?.snapshot().clone(),
++            DeltaScanConfig::new().with_row_tracking(true),
++        )?
++        .with_log_store(table.log_store());
++        let ctx = create_session().into_inner();
++        ctx.register_table("tracked", Arc::new(provider))?;
++        let filtered = ctx
++            .sql("SELECT __delta_row_id, __delta_row_commit_version FROM tracked WHERE value = 5")
++            .await?
++            .collect()
++            .await?;
++        assert_eq!(
++            filtered.iter().map(|batch| batch.num_rows()).sum::<usize>(),
++            1
++        );
++        let selected_id = filtered
++            .iter()
++            .find(|batch| batch.num_rows() > 0)
++            .unwrap()
++            .column(0)
++            .as_any()
++            .downcast_ref::<Int64Array>()
++            .unwrap()
++            .value(0);
++        assert_eq!(Some(selected_id), id_of_five);
++        Ok(())
++    }
+ }
+diff --git a/crates/core/src/operations/merge/mod.rs b/crates/core/src/operations/merge/mod.rs
+index 322c892..b31d5d5 100644
+--- a/crates/core/src/operations/merge/mod.rs
++++ b/crates/core/src/operations/merge/mod.rs
+@@ -89,6 +89,7 @@ use crate::delta_datafusion::{
+     resolve_session_state, update_datafusion_session,
+ };
+ use crate::delta_datafusion::{Expression, into_expr, maybe_into_expr};
++use crate::kernel::row_tracking::{self, ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
+ use crate::kernel::schema::cast::{merge_arrow_field, merge_arrow_schema};
+ use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
+ use crate::kernel::{
+@@ -923,6 +924,7 @@ async fn execute(
+     info!(cdc_enabled = should_cdc, "merge execution details");
+ 
+     let current_metadata = snapshot.metadata();
++    let tracking_enabled = row_tracking::is_enabled(snapshot.table_properties());
+     let merge_planner = DeltaPlanner::new();
+ 
+     let state = SessionStateBuilder::new_from_existing(state)
+@@ -986,6 +988,7 @@ async fn execute(
+             .with_eager_snapshot(snapshot.clone())
+             .with_log_store(log_store.clone())
+             .with_session(state.clone().into())
++            .with_row_tracking(tracking_enabled)
+             .with_file_column(file_column.as_str())
+             .await?,
+     );
+@@ -1061,6 +1064,7 @@ async fn execute(
+             .with_eager_snapshot(snapshot.clone())
+             .with_log_store(log_store.clone())
+             .with_session(state.clone().into())
++            .with_row_tracking(tracking_enabled)
+             .with_file_column(file_column.as_str());
+ 
+         if needs_duplicate_match_validation {
+@@ -1428,6 +1432,39 @@ async fn execute(
+         new_columns.push((name, case));
+     }
+ 
++    if tracking_enabled {
++        for metadata_name in [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN] {
++            let target_value = Expr::Column(Column::new(Some(target_name.clone()), metadata_name));
++            let value_name = format!("__delta_rs_c_{metadata_name}");
++            let mut when_expr = Vec::with_capacity(ops.len());
++            let mut then_expr = Vec::with_capacity(ops.len());
++            for (idx, (_, operation, _)) in ops.iter().enumerate() {
++                let preserve = matches!(operation, OperationType::Copy)
++                    || (metadata_name == ROW_ID_COLUMN
++                        && matches!(operation, OperationType::Update));
++                when_expr.push(lit(idx as i32));
++                then_expr.push(if preserve {
++                    target_value.clone()
++                } else {
++                    lit(ScalarValue::Int64(None))
++                });
++            }
++            let value = CaseBuilder::new(
++                Some(Box::new(col(OPERATION_COLUMN))),
++                when_expr,
++                then_expr,
++                None,
++            )
++            .end()?;
++            new_columns.push((value_name.clone(), value));
++            merge_value_column_names.push(value_name.clone());
++            write_projection.push(col(Column::from_name(value_name.clone())).alias(metadata_name));
++            // CDF metadata is not public; carrying it through this plan keeps the
++            // normal-file output aligned when the CDC sink splits the batches.
++            write_projection_with_cdf.push(col(Column::from_name(value_name)).alias(metadata_name));
++        }
++    }
++
+     write_projection_with_cdf.push(col("_change_type"));
+ 
+     let mut insert_when = Vec::with_capacity(ops.len());
+diff --git a/crates/core/src/operations/mod.rs b/crates/core/src/operations/mod.rs
+index 2d0faf9..bfb3bf7 100644
+--- a/crates/core/src/operations/mod.rs
++++ b/crates/core/src/operations/mod.rs
+@@ -21,7 +21,8 @@ use url::Url;
+ 
+ use self::{
+     add_column::AddColumnBuilder, add_feature::AddTableFeatureBuilder, create::CreateBuilder,
+-    drop_column_not_null::DropColumnNotNullBuilder, filesystem_check::FileSystemCheckBuilder,
++    drop_column_not_null::DropColumnNotNullBuilder,
++    enable_row_tracking::EnableRowTrackingBuilder, filesystem_check::FileSystemCheckBuilder,
+     restore::RestoreBuilder, set_tbl_properties::SetTablePropertiesBuilder,
+     update_field_metadata::UpdateFieldMetadataBuilder,
+     update_table_metadata::UpdateTableMetadataBuilder, vacuum::VacuumBuilder,
+@@ -50,6 +51,8 @@ pub mod convert_to_delta;
+ pub mod create;
+ pub mod drop_column_not_null;
+ pub mod drop_constraints;
++/// Enable stable identities on an existing table.
++pub mod enable_row_tracking;
+ pub mod filesystem_check;
+ pub mod generate;
+ pub mod restore;
+@@ -177,6 +180,12 @@ impl DeltaTable {
+         AddTableFeatureBuilder::new(self.log_store(), self.state.clone().map(|s| s.snapshot))
+     }
+ 
++    /// Enable stable row identities and row commit versions for this table.
++    #[must_use]
++    pub fn enable_row_tracking(self) -> EnableRowTrackingBuilder {
++        EnableRowTrackingBuilder::new(self.log_store(), self.state.clone().map(|s| s.snapshot))
++    }
++
+     /// Set table properties
+     #[must_use]
+     pub fn set_tbl_properties(self) -> SetTablePropertiesBuilder {
+diff --git a/crates/core/src/operations/optimize.rs b/crates/core/src/operations/optimize.rs
+index ab0fe29..8a42356 100644
+--- a/crates/core/src/operations/optimize.rs
++++ b/crates/core/src/operations/optimize.rs
+@@ -49,15 +49,20 @@ use crate::datafile::writer::{
+     ArrowWriterOptions, PartitionWriter, PartitionWriterConfig, UploadBudget,
+ };
+ use crate::delta_datafusion::{
+-    DeltaScanConfig, DeltaScanNext, SessionFallbackPolicy, SessionResolveContext,
+-    create_session_state_with_spill_config, resolve_session_state, update_datafusion_session,
++    ColumnMappingState, DeltaScanConfig, DeltaScanNext, SessionFallbackPolicy,
++    SessionResolveContext, create_session_state_with_spill_config, resolve_session_state,
++    update_datafusion_session,
+ };
+-use crate::errors::{ColumnMappingOperation, DeltaResult, DeltaTableError};
++use crate::errors::{DeltaResult, DeltaTableError};
++use crate::kernel::row_tracking;
+ use crate::kernel::transaction::{CommitBuilder, CommitProperties, DEFAULT_RETRIES, PROTOCOL};
+-use crate::kernel::{Action, Add, DataType, PartitionsExt, Remove, StructType, Version};
++use crate::kernel::{
++    Action, Add, DataType, LogicalFileView, PartitionsExt, Remove, StructType, Version,
++};
+ use crate::kernel::{EagerSnapshot, resolve_snapshot};
+ use crate::logstore::with_operation;
+ use crate::logstore::{LogStore, LogStoreRef, ObjectStoreRef};
++use crate::operations::write::execution::materialized_row_tracking_schema;
+ use crate::protocol::DeltaOperation;
+ use crate::table::config::TablePropertiesExt as _;
+ use crate::table::state::DeltaTableState;
+@@ -424,12 +429,6 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
+ 
+         Box::pin(async move {
+             let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
+-            if snapshot.table_configuration().column_mapping_mode() != ColumnMappingMode::None {
+-                return Err(DeltaTableError::unsupported_column_mapping(
+-                    ColumnMappingOperation::Write,
+-                    "OPTIMIZE",
+-                ));
+-            }
+             PROTOCOL.can_write_to(&snapshot)?;
+ 
+             let writer_properties = this.writer_properties;
+@@ -607,6 +606,11 @@ impl PlannerStats {
+ pub struct MergeTaskParameters {
+     /// Schema of written files
+     file_schema: SchemaRef,
++    /// Logical scan fields, in exactly the same order as the physical file fields.
++    read_schema: SchemaRef,
++    /// Translate partition keys to their physical column-mapping names.
++    partition_column_names: HashMap<String, String>,
++    random_prefix_length: Option<usize>,
+     /// How the written files are encoded; the target file size is set per task
+     writer_properties: DeltaWriterProperties,
+     /// Input parameters for the optimize operation
+@@ -691,7 +695,17 @@ impl MergePlan {
+         };
+         let writer_config = PartitionWriterConfig::try_new(
+             task_parameters.file_schema.clone(),
+-            partition_values.clone(),
++            partition_values
++                .iter()
++                .map(|(name, value)| {
++                    let name = task_parameters
++                        .partition_column_names
++                        .get(name)
++                        .cloned()
++                        .unwrap_or_else(|| name.clone());
++                    (name, value.clone())
++                })
++                .collect(),
+             task_parameters
+                 .writer_properties
+                 .clone()
+@@ -699,6 +713,10 @@ impl MergePlan {
+             None,
+             None,
+         )?
++        .with_path_prefix(task_parameters.random_prefix_length.map(|length| {
++            let prefix = uuid::Uuid::new_v4().simple().to_string();
++            object_store::path::Path::from(&prefix[..length])
++        }))
+         .with_upload_budget(task_parameters.upload_budget.clone());
+         let mut writer = PartitionWriter::try_with_config(object_store, writer_config)?;
+ 
+@@ -709,10 +727,16 @@ impl MergePlan {
+ 
+             batch = crate::kernel::schema::cast::cast_record_batch(
+                 &batch,
+-                task_parameters.file_schema.clone(),
++                task_parameters.read_schema.clone(),
+                 false,
+                 true,
+             )?;
++            // Only names and Parquet field metadata change. Rebind the same
++            // buffers after removing partition columns and normalizing types.
++            batch = RecordBatch::try_new(
++                task_parameters.file_schema.clone(),
++                batch.columns().to_vec(),
++            )?;
+             partial_metrics.num_batches += 1;
+             writer.write(&batch).await?;
+         }
+@@ -1058,11 +1082,32 @@ pub async fn create_merge_plan(
+         predicate: serde_json::to_string(&rendered_filters).ok(),
+     };
+     // Write the types the rewrite scan produces (e.g. view types), so batches need no cast
+-    let scan_config = DeltaScanConfig::new_from_session(&session);
+-    let file_schema = arrow_schema_without_partitions(
++    let scan_config = DeltaScanConfig::new_from_session(&session)
++        .with_row_tracking(row_tracking::is_enabled(snapshot.table_properties()));
++    let read_schema = arrow_schema_without_partitions(
+         &scan_config.table_schema(snapshot.table_configuration())?,
+         partitions_keys,
+     );
++    let materialized_schema =
++        materialized_row_tracking_schema(snapshot.table_configuration(), &read_schema)?;
++    let column_mapping = ColumnMappingState::from_table_config(snapshot.table_configuration());
++    let file_schema = column_mapping.as_ref().map_or_else(
++        || materialized_schema.clone(),
++        |mapping| mapping.physical_schema(&materialized_schema),
++    );
++    let physical_partitions = column_mapping
++        .as_ref()
++        .map(|mapping| mapping.physical_partition_columns(partitions_keys))
++        .transpose()?
++        .unwrap_or_else(|| partitions_keys.to_vec());
++    let partition_column_names = partitions_keys
++        .iter()
++        .cloned()
++        .zip(physical_partitions)
++        .collect();
++    let random_prefix_length = column_mapping
++        .as_ref()
++        .map(ColumnMappingState::random_prefix_length);
+ 
+     Ok(MergePlan {
+         operations,
+@@ -1070,6 +1115,9 @@ pub async fn create_merge_plan(
+         planner_stats,
+         task_parameters: Arc::new(MergeTaskParameters {
+             file_schema,
++            read_schema,
++            partition_column_names,
++            random_prefix_length,
+             writer_properties: writer_properties.apply_table_stats(snapshot.table_configuration()),
+             input_parameters,
+             upload_budget,
+@@ -1201,6 +1249,48 @@ fn plan_compaction_bins_in_stable_order(
+     (bins, planner_stats)
+ }
+ 
++/// Group using logical partition names, while resolving name-mapped log keys
++/// through the physical field names. The writer translates the keys back when
++/// emitting Add actions.
++fn optimize_partition_values(
++    file: &LogicalFileView,
++    partition_columns: &[String],
++    snapshot: &EagerSnapshot,
++) -> DeltaResult<IndexMap<String, Scalar>> {
++    let schema = snapshot.schema();
++    let mode = snapshot.table_configuration().column_mapping_mode();
++    if mode == ColumnMappingMode::None {
++        return file.full_partition_values(partition_columns, schema.as_ref());
++    }
++    let raw_values = file.partition_values_map();
++    let mut values = IndexMap::with_capacity(partition_columns.len());
++    for name in partition_columns {
++        let field = schema
++            .field(name)
++            .ok_or_else(|| DeltaTableError::SchemaMismatch {
++                msg: format!("Partition column '{name}' is not present in table schema"),
++            })?;
++        let primitive = field.data_type().as_primitive_opt().ok_or_else(|| {
++            DeltaTableError::SchemaMismatch {
++                msg: format!("Partition column '{name}' is not primitive"),
++            }
++        })?;
++        let value = match raw_values.get(field.physical_name(mode)) {
++            Some(Some(raw)) => primitive.parse_scalar(raw)?,
++            Some(None) => Scalar::Null(field.data_type().clone()),
++            None => {
++                return Err(DeltaTableError::SchemaMismatch {
++                    msg: format!(
++                        "Add action for optimized file is missing physical partition value for '{name}'"
++                    ),
++                });
++            }
++        };
++        values.insert(name.clone(), value);
++    }
++    Ok(values)
++}
++
+ async fn build_compaction_plan(
+     log_store: &dyn LogStore,
+     snapshot: &EagerSnapshot,
+@@ -1213,7 +1303,6 @@ async fn build_compaction_plan(
+     let mut planner_stats = PlannerStats::preserve_locality();
+     let mut partition_files: HashMap<String, PartitionFileEntry> = HashMap::new();
+     let partition_columns = snapshot.metadata().partition_columns();
+-    let table_schema = snapshot.schema();
+ 
+     let predicate = if filters.is_empty() {
+         None
+@@ -1231,8 +1320,7 @@ async fn build_compaction_plan(
+         let file = file?;
+         metrics.total_considered_files += 1;
+         let object_meta = ObjectMeta::try_from(&file)?;
+-        let partition_values =
+-            file.full_partition_values(partition_columns, table_schema.as_ref())?;
++        let partition_values = optimize_partition_values(&file, partition_columns, snapshot)?;
+         let partition_path = partition_values.hive_partition_path();
+         let entry = partition_files
+             .entry(partition_path)
+@@ -1344,7 +1432,6 @@ async fn build_zorder_plan(
+     let mut metrics = Metrics::default();
+ 
+     let mut partition_files: HashMap<String, (IndexMap<String, Scalar>, MergeBin)> = HashMap::new();
+-    let table_schema = snapshot.schema();
+ 
+     let predicate = if filters.is_empty() {
+         None
+@@ -1358,7 +1445,7 @@ async fn build_zorder_plan(
+     let mut file_stream = snapshot.file_views(log_store, predicate);
+     while let Some(file) = file_stream.next().await {
+         let file = file?;
+-        let partition_values = file.full_partition_values(partition_keys, table_schema.as_ref())?;
++        let partition_values = optimize_partition_values(&file, partition_keys, snapshot)?;
+         metrics.total_considered_files += 1;
+         partition_files
+             .entry(partition_values.hive_partition_path())
+diff --git a/crates/core/src/operations/restore.rs b/crates/core/src/operations/restore.rs
+index 53dc11d..7a7d055 100644
+--- a/crates/core/src/operations/restore.rs
++++ b/crates/core/src/operations/restore.rs
+@@ -32,6 +32,7 @@ use object_store::path::Path;
+ use object_store::{ObjectStore, ObjectStoreExt as _};
+ use serde::Serialize;
+ 
++use crate::kernel::row_tracking;
+ use crate::kernel::transaction::{CommitBuilder, CommitProperties};
+ use crate::kernel::{
+     Action, ActiveAddOptions, Add, AddStatsPolicy, EagerSnapshot, LogicalFileView,
+@@ -194,7 +195,7 @@ async fn plan_restore_file_changes(
+     Ok((files_to_add, files_to_remove))
+ }
+ 
+-fn restore_file_key(file: &LogicalFileView) -> (Path, Option<String>) {
++fn restore_file_key(file: &LogicalFileView) -> (Path, Option<String>, Option<i64>, Option<i64>) {
+     let deletion_vector_id =
+         file.deletion_vector_descriptor()
+             .map(|deletion_vector| match deletion_vector.offset {
+@@ -207,7 +208,13 @@ fn restore_file_key(file: &LogicalFileView) -> (Path, Option<String>) {
+                     deletion_vector.storage_type, deletion_vector.path_or_inline_dv
+                 ),
+             });
+-    (file.object_store_path(), deletion_vector_id)
++    let add = file.to_add();
++    (
++        file.object_store_path(),
++        deletion_vector_id,
++        add.base_row_id,
++        add.default_row_commit_version,
++    )
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -240,6 +247,15 @@ async fn execute(
+     let current_snapshot: &Snapshot = snapshot.snapshot();
+     let snapshot_restored = table.snapshot()?;
+     let target_snapshot: &Snapshot = snapshot_restored.snapshot().snapshot();
++    if row_tracking::is_enabled(current_snapshot.table_properties())
++        && !row_tracking::is_enabled(target_snapshot.table_properties())
++    {
++        return Err(DeltaTableError::InvalidData {
++            message:
++                "restoring an enabled row-tracked table to an untracked version is unsupported"
++                    .into(),
++        });
++    }
+     let version = target_snapshot.version();
+ 
+     if version >= current_snapshot.version() {
+@@ -314,6 +330,9 @@ async fn execute(
+     actions.extend(files_to_remove.into_iter().map(Action::Remove));
+     // Add the metadata from the restored version to undo e.g. constraint or field metadata changes
+     actions.push(Action::Metadata(metadata_restored_version.clone()));
++    // Do not restore historical domainMetadata. Commit preparation retains the
++    // current allocation high-water mark while the Adds above retain the target
++    // snapshot's historical base IDs and default commit versions.
+ 
+     let operation = DeltaOperation::Restore {
+         version: version_to_restore,
+diff --git a/crates/core/src/operations/update.rs b/crates/core/src/operations/update.rs
+index 6d8a46d..e46cd85 100644
+--- a/crates/core/src/operations/update.rs
++++ b/crates/core/src/operations/update.rs
+@@ -42,13 +42,16 @@ use parquet::file::properties::WriterProperties;
+ use serde::Serialize;
+ use tracing::log::*;
+ 
+-use super::write::execution::{write_execution_plan, write_execution_plan_cdc};
++use super::write::execution::{
++    row_tracking_rewrite_scan, write_execution_plan, write_execution_plan_cdc,
++};
+ use crate::datafile::DeltaWriterProperties;
+ use crate::datafile::writer::ArrowWriterOptions;
+ use crate::delta_datafusion::{
+     DeltaScanConfig, Expression, scan_files_where_matches, update_datafusion_session,
+ };
+ use crate::kernel::resolve_snapshot;
++use crate::kernel::row_tracking::{self, ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
+ use crate::logstore::LogStoreRef;
+ use crate::logstore::with_operation;
+ use crate::operations::cdc::*;
+@@ -302,6 +305,15 @@ async fn execute(
+     let schema = scan_config
+         .table_schema(snapshot.table_configuration())?
+         .to_dfschema_ref()?;
++    if row_tracking::is_enabled(snapshot.table_properties())
++        && updates.keys().any(|column| {
++            [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN].contains(&column.name.as_str())
++        })
++    {
++        return Err(DeltaTableError::InvalidData {
++            message: "row tracking metadata columns cannot be assigned by UPDATE".into(),
++        });
++    }
+     let updates: HashMap<_, _> = updates
+         .into_iter()
+         .map(|(key, expr)| expr.resolve(session, schema.clone()).map(|e| (key.name, e)))
+@@ -317,6 +329,8 @@ async fn execute(
+         // no files contain data matching the predicate, so nothing more todo.
+         return Ok((vec![], metrics));
+     };
++    let rewrite_scan =
++        row_tracking_rewrite_scan(session, snapshot, log_store.clone(), &files_scan)?;
+ 
+     // Take advantage of how null counts are tracked in arrow arrays use the
+     // null count to track how many records do NOT satisfy the predicate.  The
+@@ -324,8 +338,7 @@ async fn execute(
+     // execution plan
+     let predicate_null =
+         when(files_scan.predicate.clone(), lit(true)).otherwise(lit(ScalarValue::Boolean(None)))?;
+-    let input = files_scan
+-        .scan()
++    let input = rewrite_scan
+         .clone()
+         .into_builder()
+         .with_column(UPDATE_PREDICATE_COLNAME, predicate_null)?
+@@ -344,6 +357,14 @@ async fn execute(
+         .fields()
+         .into_iter()
+         .map(|field| {
++            if row_tracking::is_enabled(snapshot.table_properties())
++                && field.name() == ROW_COMMIT_VERSION_COLUMN
++            {
++                return Ok(case(col(UPDATE_PREDICATE_COLNAME))
++                    .when(lit(true), lit(ScalarValue::Int64(None)))
++                    .otherwise(col(Column::from_name(ROW_COMMIT_VERSION_COLUMN)))?
++                    .alias(ROW_COMMIT_VERSION_COLUMN));
++            }
+             let expr = match updates.get(field.name()) {
+                 Some(expr) => {
+                     let target_type = field.data_type().clone();
+@@ -371,7 +392,7 @@ async fn execute(
+         .build()?;
+ 
+     let physical_plan = session.create_physical_plan(&plan_updated).await?;
+-    let tracker = CDCTracker::new(files_scan.scan().clone(), plan_updated);
++    let tracker = CDCTracker::new(rewrite_scan, plan_updated);
+ 
+     let mut actions = write_execution_plan(
+         snapshot.table_configuration(),
+diff --git a/crates/core/src/operations/write/execution.rs b/crates/core/src/operations/write/execution.rs
+index 3854d86..f25e425 100644
+--- a/crates/core/src/operations/write/execution.rs
++++ b/crates/core/src/operations/write/execution.rs
+@@ -5,7 +5,8 @@ use arrow::datatypes::Schema;
+ use arrow_array::RecordBatch;
+ use datafusion::catalog::Session;
+ use datafusion::common::ToDFSchema;
+-use datafusion::logical_expr::{Expr, col, lit, when};
++use datafusion::datasource::provider_as_source;
++use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, col, lit, when};
+ use datafusion::physical_expr::expressions::col as physical_col;
+ use datafusion::physical_plan::projection::ProjectionExec;
+ use datafusion::physical_plan::repartition::RepartitionExec;
+@@ -22,10 +23,14 @@ use tokio::task::JoinSet;
+ use crate::DeltaTableError;
+ use crate::datafile::DeltaWriterProperties;
+ use crate::datafile::writer::{DeltaWriter, UploadBudget, WriterConfig, write_batches_timed};
+-use crate::delta_datafusion::{ColumnMappingState, DataValidationExec, validation_predicates};
++use crate::delta_datafusion::{
++    ColumnMappingState, DataValidationExec, DeltaScanConfig, DeltaScanNext, MatchedFilesScan,
++    validation_predicates,
++};
+ use crate::errors::DeltaResult;
+-use crate::kernel::{Action, Add, AddCDCFile};
+-use crate::logstore::{LogStore, ObjectStoreRef};
++use crate::kernel::row_tracking::{self, ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
++use crate::kernel::{Action, Add, AddCDCFile, Snapshot};
++use crate::logstore::{LogStore, LogStoreRef, ObjectStoreRef};
+ use crate::operations::cdc::CDC_COLUMN_NAME;
+ 
+ /// Error message used when a worker's `send` fails because the writer task has
+@@ -34,6 +39,96 @@ use crate::operations::cdc::CDC_COLUMN_NAME;
+ /// instead of this downstream symptom.
+ const WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG: &str = "Writer task closed unexpectedly";
+ 
++/// Rescan the selected files with stable metadata before any row filter is applied.
++/// File discovery remains an ordinary user-data scan; only the rewrite needs the
++/// hidden columns, and the provider reconstructs them using physical ordinals.
++pub(crate) fn row_tracking_rewrite_scan(
++    session: &dyn Session,
++    snapshot: &Snapshot,
++    log_store: LogStoreRef,
++    files: &MatchedFilesScan,
++) -> DeltaResult<LogicalPlan> {
++    if !row_tracking::is_enabled(snapshot.table_properties()) {
++        return Ok(files.scan().clone());
++    }
++    let provider = DeltaScanNext::new(
++        snapshot.clone(),
++        DeltaScanConfig::new_from_session(session).with_row_tracking(true),
++    )?
++    .with_log_store(log_store)
++    .with_file_paths(files.files_set());
++    Ok(
++        LogicalPlanBuilder::scan("source", provider_as_source(Arc::new(provider)), None)?
++            .build()?,
++    )
++}
++
++/// Translate metadata output names to the table's physical materialized names.
++/// NULL values intentionally survive this projection: commit preparation assigns
++/// the file defaults at the successful commit, including after retry.
++pub(crate) fn materialize_row_tracking_plan(
++    table_config: &TableConfiguration,
++    plan: Arc<dyn ExecutionPlan>,
++) -> DeltaResult<Arc<dyn ExecutionPlan>> {
++    if !row_tracking::is_enabled(table_config.table_properties()) {
++        return Ok(plan);
++    }
++    let (row_id, version) =
++        row_tracking::materialized_column_names(table_config.table_properties())?;
++    let schema = plan.schema();
++    let has_id = schema.column_with_name(ROW_ID_COLUMN).is_some();
++    let has_version = schema.column_with_name(ROW_COMMIT_VERSION_COLUMN).is_some();
++    if has_id != has_version {
++        return Err(DeltaTableError::InvalidData {
++            message: "row tracking rewrite must carry both metadata columns".into(),
++        });
++    }
++    // Ordinary inserts need no materialized columns; Add defaults give them fresh identity.
++    if !has_id {
++        return Ok(plan);
++    }
++    let expressions = schema
++        .fields()
++        .iter()
++        .map(|field| {
++            let name = match field.name().as_str() {
++                ROW_ID_COLUMN => row_id,
++                ROW_COMMIT_VERSION_COLUMN => version,
++                name => name,
++            };
++            Ok((physical_col(field.name(), &schema)?, name.to_owned()))
++        })
++        .collect::<DeltaResult<Vec<_>>>()?;
++    Ok(Arc::new(ProjectionExec::try_new(expressions, plan)?))
++}
++
++pub(crate) fn materialized_row_tracking_schema(
++    table_config: &TableConfiguration,
++    schema: &arrow_schema::SchemaRef,
++) -> DeltaResult<arrow_schema::SchemaRef> {
++    if !row_tracking::is_enabled(table_config.table_properties()) {
++        return Ok(schema.clone());
++    }
++    let (row_id, version) =
++        row_tracking::materialized_column_names(table_config.table_properties())?;
++    let fields = schema
++        .fields()
++        .iter()
++        .map(|field| {
++            let name = match field.name().as_str() {
++                ROW_ID_COLUMN => row_id,
++                ROW_COMMIT_VERSION_COLUMN => version,
++                name => name,
++            };
++            field.as_ref().clone().with_name(name)
++        })
++        .collect::<Vec<_>>();
++    Ok(Arc::new(Schema::new_with_metadata(
++        fields,
++        schema.metadata().clone(),
++    )))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::num::NonZeroU64;
+@@ -45,22 +140,203 @@ mod tests {
+     use std::task::{Context, Poll};
+     use std::time::Duration;
+ 
+-    use arrow_array::{Int64Array, RecordBatch};
++    use arrow_array::{Int64Array, RecordBatch, StringArray};
+     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+     use datafusion::common::Result as DataFusionResult;
+     use datafusion::error::DataFusionError;
+     use datafusion::physical_plan::{RecordBatchStream, stream::RecordBatchStreamAdapter};
+-    use futures::{Stream, stream};
++    use futures::{Stream, TryStreamExt as _, stream};
+     use object_store::memory::InMemory;
+     use rstest::rstest;
+ 
+     use crate::datafile::writer::test_utils::test_props;
++    use crate::kernel::row_tracking::{ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
++    use crate::operations::optimize::OptimizeType;
++    use crate::protocol::SaveMode;
++    use crate::{DeltaResult, DeltaTable};
+ 
+     use super::{
+         ObjectStoreRef, SendableRecordBatchStream, WriterConfig, parse_positive_usize,
+         write_streams,
+     };
+ 
++    fn mutation_batch(keys: Vec<i64>, values: Vec<i64>) -> RecordBatch {
++        let count = keys.len();
++        RecordBatch::try_new(
++            Arc::new(ArrowSchema::new(vec![
++                Field::new("key", DataType::Int64, false),
++                Field::new("value", DataType::Int64, false),
++                Field::new("part", DataType::Utf8, false),
++            ])),
++            vec![
++                Arc::new(Int64Array::from(keys)),
++                Arc::new(Int64Array::from(values)),
++                Arc::new(StringArray::from(vec!["p"; count])),
++            ],
++        )
++        .unwrap()
++    }
++
++    // Sorted by stable ID, so every assertion is independent of physical row order.
++    async fn tracked_rows(table: &DeltaTable) -> DeltaResult<Vec<(i64, i64, i64, i64)>> {
++        let (_, stream) = table.scan_table().with_row_tracking(true).await?;
++        let batches: Vec<RecordBatch> = stream.try_collect().await?;
++        let mut rows = Vec::new();
++        for batch in batches {
++            let columns = [ROW_ID_COLUMN, ROW_COMMIT_VERSION_COLUMN, "key", "value"].map(|name| {
++                let column = batch.column_by_name(name).unwrap();
++                assert_eq!(column.null_count(), 0);
++                column.as_any().downcast_ref::<Int64Array>().unwrap()
++            });
++            for row in 0..batch.num_rows() {
++                rows.push((
++                    columns[0].value(row),
++                    columns[1].value(row),
++                    columns[2].value(row),
++                    columns[3].value(row),
++                ));
++            }
++        }
++        rows.sort_unstable();
++        assert!(rows.windows(2).all(|pair| pair[0].0 != pair[1].0));
++        Ok(rows)
++    }
++
++    #[rstest]
++    #[case::plain(false, false)]
++    #[case::partitioned(false, true)]
++    #[case::mapped(true, false)]
++    #[case::mapped_partitioned(true, true)]
++    #[tokio::test]
++    async fn row_tracking_mutations_preserve_identity(
++        #[case] mapped: bool,
++        #[case] partitioned: bool,
++    ) -> DeltaResult<()> {
++        use datafusion::logical_expr::{col, lit};
++
++        let mut writer = DeltaTable::new_in_memory()
++            .write(vec![mutation_batch(vec![1, 1, 2, 3], vec![10, 10, 20, 30])]);
++        if mapped {
++            writer = writer.with_configuration([("delta.columnMapping.mode", Some("name"))]);
++        }
++        if partitioned {
++            writer = writer.with_partition_columns(["part"]);
++        }
++        let table = writer.await?.enable_row_tracking().await?;
++        let original = tracked_rows(&table).await?;
++        assert_eq!(original.len(), 4);
++        let historical_version = table.version().unwrap();
++
++        // Even an equal-value assignment changes selected row versions.
++        let (table, _) = table
++            .update()
++            .with_predicate(col("key").eq(lit(1_i64)))
++            .with_update("value", col("value"))
++            .await?;
++        let mut expected = original.clone();
++        for row in &mut expected {
++            if row.2 == 1 {
++                row.1 = i64::try_from(table.version().unwrap()).unwrap();
++            }
++        }
++        assert_eq!(tracked_rows(&table).await?, expected);
++
++        let (table, _) = table
++            .delete()
++            .with_predicate(col("key").eq(lit(3_i64)))
++            .await?;
++        expected.retain(|row| row.2 != 3);
++        assert_eq!(tracked_rows(&table).await?, expected);
++
++        let source = crate::delta_datafusion::create_session()
++            .into_inner()
++            .read_batch(mutation_batch(vec![2, 4], vec![200, 40]))?;
++        let (table, _) = table
++            .merge(source, col("target.key").eq(col("source.key")))
++            .with_source_alias("source")
++            .with_target_alias("target")
++            .when_matched_update(|update| update.update("value", col("source.value")))?
++            .when_not_matched_insert(|insert| {
++                insert
++                    .set("key", col("source.key"))
++                    .set("value", col("source.value"))
++                    .set("part", col("source.part"))
++            })?
++            .await?;
++        for row in &mut expected {
++            if row.2 == 2 {
++                row.1 = i64::try_from(table.version().unwrap()).unwrap();
++                row.3 = 200;
++            }
++        }
++        let merged = tracked_rows(&table).await?;
++        let inserted = *merged.iter().find(|row| row.2 == 4).unwrap();
++        assert!(inserted.0 > original.iter().map(|row| row.0).max().unwrap());
++        assert_eq!(inserted.1, i64::try_from(table.version().unwrap()).unwrap());
++        expected.push(inserted);
++        expected.sort_unstable();
++        assert_eq!(merged, expected);
++
++        let table = table.write(vec![mutation_batch(vec![5], vec![50])]).await?;
++        let before_optimize = tracked_rows(&table).await?;
++        let (table, metrics) = table.optimize().await?;
++        assert!(metrics.num_files_removed >= 2);
++        assert_eq!(tracked_rows(&table).await?, before_optimize);
++        let (table, _) = table
++            .optimize()
++            .with_type(OptimizeType::ZOrder(vec!["value".into()]))
++            .await?;
++        assert_eq!(tracked_rows(&table).await?, before_optimize);
++
++        let allocated = before_optimize.iter().map(|row| row.0).max().unwrap();
++        let (table, _) = table
++            .restore()
++            .with_version_to_restore(historical_version)
++            .await?;
++        assert_eq!(tracked_rows(&table).await?, original);
++        let table = table.write(vec![mutation_batch(vec![6], vec![60])]).await?;
++        let restored_rows = tracked_rows(&table).await?;
++        let fresh = restored_rows.iter().find(|row| row.2 == 6).unwrap();
++        assert!(fresh.0 > allocated);
++        assert_eq!(fresh.1, i64::try_from(table.version().unwrap()).unwrap());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn row_tracking_replace_where_preserves_rescued_rows() -> DeltaResult<()> {
++        use datafusion::logical_expr::{col, lit};
++
++        let table = DeltaTable::new_in_memory()
++            .write(vec![mutation_batch(vec![1, 1, 2], vec![10, 10, 20])])
++            .await?
++            .enable_row_tracking()
++            .await?;
++        let original = tracked_rows(&table).await?;
++        let table = table
++            .write(vec![mutation_batch(vec![2], vec![200])])
++            .with_save_mode(SaveMode::Overwrite)
++            .with_replace_where(col("key").eq(lit(2_i64)))
++            .await?;
++        let actual = tracked_rows(&table).await?;
++        assert_eq!(
++            actual
++                .iter()
++                .filter(|row| row.2 == 1)
++                .copied()
++                .collect::<Vec<_>>(),
++            original
++                .iter()
++                .filter(|row| row.2 == 1)
++                .copied()
++                .collect::<Vec<_>>()
++        );
++        let inserted = actual.iter().find(|row| row.2 == 2).unwrap();
++        assert!(inserted.0 > original.iter().map(|row| row.0).max().unwrap());
++        assert_eq!(inserted.1, i64::try_from(table.version().unwrap()).unwrap());
++        assert_eq!(inserted.3, 200);
++        Ok(())
++    }
++
+     #[rstest]
+     #[case::zero(Some("0"), 7)]
+     #[case::negative(Some("-1"), 7)]
+@@ -389,6 +665,7 @@ pub(crate) async fn write_execution_plan_cdc(
+     props: DeltaWriterProperties,
+ ) -> DeltaResult<Vec<Action>> {
+     let plan = validated_plan(table_config, session, plan, None, false, None)?;
++    let plan = materialize_row_tracking_plan(table_config, plan)?;
+     let sink_config =
+         WriteSinkConfig::new(table_config, object_store, props).with_path_prefix(CHANGE_DATA_DIR);
+     let (actions, _) = write_data_plan(session, plan, sink_config).await?;
+@@ -441,6 +718,7 @@ pub(crate) async fn write_execution_plan_v2(
+         contains_cdc,
+         insert_marker_column.as_deref(),
+     )?;
++    let plan = materialize_row_tracking_plan(table_config, plan)?;
+     let sink_config = WriteSinkConfig::new(table_config, object_store, props);
+ 
+     if !contains_cdc {
+@@ -481,6 +759,7 @@ pub(crate) async fn write_exec_plan(
+     write_as_cdc: bool,
+     props: DeltaWriterProperties,
+ ) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
++    let exec = materialize_row_tracking_plan(table_config, exec)?;
+     let sink_config = WriteSinkConfig::new(table_config, log_store.object_store(), props);
+ 
+     if write_as_cdc {
+diff --git a/crates/core/src/operations/write/plan.rs b/crates/core/src/operations/write/plan.rs
+index 0504fb2..3a6d31b 100644
+--- a/crates/core/src/operations/write/plan.rs
++++ b/crates/core/src/operations/write/plan.rs
+@@ -22,6 +22,7 @@ use futures::TryStreamExt as _;
+ use itertools::Itertools as _;
+ use uuid::Uuid;
+ 
++use super::execution::row_tracking_rewrite_scan;
+ use super::generated_columns::{gc_is_enabled, with_generated_columns};
+ use super::metrics::SOURCE_COUNT_ID;
+ use super::schema_evolution::try_cast_schema;
+@@ -32,6 +33,7 @@ use crate::delta_datafusion::{
+     DataFusionMixins, Expression, analyze_predicate_for_find_files, scan_files_where_matches,
+ };
+ use crate::errors::{DeltaResult, DeltaTableError};
++use crate::kernel::row_tracking::{self, ROW_COMMIT_VERSION_COLUMN, ROW_ID_COLUMN};
+ use crate::kernel::schema::cast::{merge_arrow_schema, normalize_for_delta};
+ use crate::kernel::{
+     Action, ActiveAddOptions, Add, AddStatsPolicy, DeletionVectorDescriptor, EagerSnapshot,
+@@ -501,13 +503,21 @@ pub(super) async fn plan_overwrite_rewrite(
+                 write_id,
+             );
+ 
+-            let validated_inserts = mark_insert_rows(
+-                prepared_write.insert_plan.clone(),
+-                &insert_marker_column,
+-                true,
+-            )?;
++            let rewrite_scan =
++                row_tracking_rewrite_scan(session, snapshot, log_store.clone(), &files_scan)?;
++            let insert_plan = if row_tracking::is_enabled(snapshot.table_properties()) {
++                // New rows use the file's commit-time defaults. Existing survivors
++                // below retain materialized metadata while sharing the same output files.
++                LogicalPlanBuilder::new(prepared_write.insert_plan.clone())
++                    .with_column(ROW_ID_COLUMN, lit(ScalarValue::Int64(None)))?
++                    .with_column(ROW_COMMIT_VERSION_COLUMN, lit(ScalarValue::Int64(None)))?
++                    .build()?
++            } else {
++                prepared_write.insert_plan.clone()
++            };
++            let validated_inserts = mark_insert_rows(insert_plan, &insert_marker_column, true)?;
+             let rescued_data = mark_insert_rows(
+-                LogicalPlanBuilder::new(files_scan.scan().clone())
++                LogicalPlanBuilder::new(rewrite_scan.clone())
+                     // `IS NOT TRUE` keeps rows where the predicate is FALSE or NULL so nullable
+                     // predicate columns are rescued instead of being rewritten.
+                     .filter(files_scan.predicate.clone().is_not_true())?
+@@ -522,7 +532,7 @@ pub(super) async fn plan_overwrite_rewrite(
+ 
+             let cdc_plan = if should_write_cdc(eager_snapshot)? {
+                 Some(
+-                    LogicalPlanBuilder::new(files_scan.scan().clone())
++                    LogicalPlanBuilder::new(rewrite_scan)
+                         .filter(files_scan.predicate.clone())?
+                         .with_column(insert_marker_column.as_str(), lit(false))?
+                         .with_column(CDC_COLUMN_NAME, lit("delete"))?
+diff --git a/crates/core/src/table/config.rs b/crates/core/src/table/config.rs
+index 70c9a43..fd2b7d8 100644
+--- a/crates/core/src/table/config.rs
++++ b/crates/core/src/table/config.rs
+@@ -75,6 +75,12 @@ pub enum TableProperty {
+     /// true to enable deletion vectors and predictive I/O for updates.
+     EnableDeletionVectors,
+ 
++    /// true to enable stable row identities and row commit versions.
++    EnableRowTracking,
++
++    /// true to suspend row tracking assignment. This implementation rejects the transition.
++    RowTrackingSuspended,
++
+     /// The degree to which a transaction must be isolated from modifications made by concurrent transactions.
+     ///
+     /// Valid values are `Serializable` and `WriteSerializable`.
+@@ -140,6 +146,8 @@ impl AsRef<str> for TableProperty {
+             Self::DeletedFileRetentionDuration => "delta.deletedFileRetentionDuration",
+             Self::EnableChangeDataFeed => "delta.enableChangeDataFeed",
+             Self::EnableDeletionVectors => "delta.enableDeletionVectors",
++            Self::EnableRowTracking => "delta.enableRowTracking",
++            Self::RowTrackingSuspended => "delta.rowTrackingSuspended",
+             Self::IsolationLevel => "delta.isolationLevel",
+             Self::LogRetentionDuration => "delta.logRetentionDuration",
+             Self::EnableExpiredLogCleanup => "delta.enableExpiredLogCleanup",
+@@ -176,6 +184,8 @@ impl FromStr for TableProperty {
+             }
+             "delta.enableChangeDataFeed" => Ok(Self::EnableChangeDataFeed),
+             "delta.enableDeletionVectors" => Ok(Self::EnableDeletionVectors),
++            "delta.enableRowTracking" => Ok(Self::EnableRowTracking),
++            "delta.rowTrackingSuspended" => Ok(Self::RowTrackingSuspended),
+             "delta.isolationLevel" => Ok(Self::IsolationLevel),
+             "delta.logRetentionDuration" | "logRetentionDuration" => Ok(Self::LogRetentionDuration),
+             "delta.enableExpiredLogCleanup" | "enableExpiredLogCleanup" => {
+diff --git a/crates/core/tests/row_tracking_api.rs b/crates/core/tests/row_tracking_api.rs
+new file mode 100644
+index 0000000..5a198cc
+--- /dev/null
++++ b/crates/core/tests/row_tracking_api.rs
+@@ -0,0 +1,110 @@
++#![cfg(feature = "datafusion")]
++
++use std::collections::HashSet;
++use std::sync::Arc;
++
++use arrow::array::{Array, Int64Array, StringArray};
++use arrow::record_batch::RecordBatch;
++use arrow_schema::{DataType, Field, Schema};
++use deltalake_core::DeltaTable;
++use futures::TryStreamExt;
++
++type TestResult = Result<(), Box<dyn std::error::Error>>;
++
++fn batch() -> RecordBatch {
++    RecordBatch::try_new(
++        Arc::new(Schema::new(vec![
++            Field::new("value", DataType::Int64, true),
++            Field::new("label", DataType::Utf8, true),
++        ])),
++        vec![
++            Arc::new(Int64Array::from(vec![Some(7), Some(7), None])),
++            Arc::new(StringArray::from(vec![Some("same"), Some("same"), None])),
++        ],
++    )
++    .unwrap()
++}
++
++#[tokio::test]
++async fn native_tracked_scan_projects_users_then_nonnullable_metadata() -> TestResult {
++    let table = DeltaTable::new_in_memory().write(vec![batch()]).await?;
++    let table = table.enable_row_tracking().await?;
++    let version = table.version().unwrap();
++    let (_, stream) = table
++        .scan_table()
++        .with_columns(["label"])
++        .with_row_tracking(true)
++        .await?;
++    let schema = stream.schema();
++    assert_eq!(
++        schema
++            .fields()
++            .iter()
++            .map(|f| f.name().as_str())
++            .collect::<Vec<_>>(),
++        ["label", "__delta_row_id", "__delta_row_commit_version"]
++    );
++    for name in ["__delta_row_id", "__delta_row_commit_version"] {
++        let field = schema.field_with_name(name)?;
++        assert_eq!(field.data_type(), &DataType::Int64);
++        assert!(!field.is_nullable());
++    }
++    let batches: Vec<RecordBatch> = stream.try_collect().await?;
++    let mut ids = HashSet::new();
++    let mut labels = Vec::new();
++    for batch in batches {
++        let row_ids = batch
++            .column(1)
++            .as_any()
++            .downcast_ref::<Int64Array>()
++            .unwrap();
++        let versions = batch
++            .column(2)
++            .as_any()
++            .downcast_ref::<Int64Array>()
++            .unwrap();
++        assert_eq!(row_ids.null_count(), 0);
++        assert_eq!(versions.null_count(), 0);
++        for row in 0..batch.num_rows() {
++            assert!(ids.insert(row_ids.value(row)));
++            assert!(row_ids.value(row) >= 0);
++            assert_eq!(versions.value(row), version as i64);
++        }
++        labels.extend((0..batch.num_rows()).map(|row| !batch.column(0).is_null(row)));
++    }
++    assert_eq!(ids.len(), 3);
++    assert_eq!(labels.iter().filter(|&&valid| valid).count(), 2);
++    let (_, ordinary) = table.scan_table().await?;
++    assert_eq!(ordinary.schema().fields().len(), 2);
++    let again = table.enable_row_tracking().await?;
++    assert_eq!(again.version(), Some(version));
++    Ok(())
++}
++
++#[tokio::test]
++async fn native_tracking_request_on_unenabled_table_is_an_error() -> TestResult {
++    let table = DeltaTable::new_in_memory().write(vec![batch()]).await?;
++    assert!(table.scan_table().with_row_tracking(true).await.is_err());
++    let (_, stream) = table.scan_table().await?;
++    let batches: Vec<RecordBatch> = stream.try_collect().await?;
++    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
++    Ok(())
++}
++
++#[tokio::test]
++async fn native_metadata_only_projection_keeps_every_logical_row() -> TestResult {
++    let table = DeltaTable::new_in_memory()
++        .write(vec![batch()])
++        .await?
++        .enable_row_tracking()
++        .await?;
++    let (_, stream) = table
++        .scan_table()
++        .with_columns(Vec::<String>::new())
++        .with_row_tracking(true)
++        .await?;
++    assert_eq!(stream.schema().fields().len(), 2);
++    let batches: Vec<RecordBatch> = stream.try_collect().await?;
++    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
++    Ok(())
++}
+diff --git a/python/deltalake/_internal.pyi b/python/deltalake/_internal.pyi
+index 2ce42de..018e8e3 100644
+--- a/python/deltalake/_internal.pyi
++++ b/python/deltalake/_internal.pyi
+@@ -186,6 +186,12 @@ class RawDeltaTable:
+         commit_properties: CommitProperties | None,
+         post_commithook_properties: PostCommitHookProperties | None,
+     ) -> None: ...
++    def enable_row_tracking(
++        self,
++        *,
++        commit_properties: CommitProperties | None = None,
++        post_commithook_properties: PostCommitHookProperties | None = None,
++    ) -> None: ...
+     def set_table_properties(
+         self,
+         properties: dict[str, str],
+@@ -291,6 +297,8 @@ class RawDeltaTable:
+         self,
+         columns: list[str] | None = None,
+         predicate: str | None = None,
++        *,
++        include_row_tracking: bool = False,
+     ) -> RecordBatchReader: ...
+     def deletion_vectors(self) -> RecordBatchReader: ...
+     def transaction_version(self, app_id: str) -> int | None: ...
+diff --git a/python/deltalake/table.py b/python/deltalake/table.py
+index 36365f5..b03553b 100644
+--- a/python/deltalake/table.py
++++ b/python/deltalake/table.py
+@@ -1426,6 +1426,8 @@ class DeltaTable:
+         filesystem: str | pa_fs.FileSystem | None = None,
+         filters: str | FilterType | Expression | None = None,
+         engine: Literal["pyarrow", "datafusion"] = "pyarrow",
++        *,
++        include_row_tracking: bool = False,
+     ) -> "pyarrow.Table":
+         """
+         Build a PyArrow Table using data from the DeltaTable.
+@@ -1463,7 +1465,28 @@ class DeltaTable:
+             filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem. `engine="pyarrow"` only
+             filters: A SQL predicate string (`engine="datafusion"` only) or a disjunctive normal form (DNF) tuple predicate for filtering rows. `engine="pyarrow"` also accepts a pyarrow.dataset.Expression
+             engine: The engine reading the table. The pyarrow engine is deprecated and will be removed in a future release
++            include_row_tracking: With `engine="datafusion"`, append non-null int64
++                `__delta_row_id` and `__delta_row_commit_version` columns after the
++                projected user columns. Requires row tracking to be enabled.
++
++        Raises:
++            TypeError: If `include_row_tracking` is not a bool.
++            ValueError: If tracking is requested with the pyarrow engine, or
++                `columns` explicitly selects tracking metadata.
++            DeltaError: If native tracking state is unsupported or invalid.
++                InvalidData errors (including corrupt metadata and allocation
++                overflow) map to DeltaProtocolError, a DeltaError subclass.
++
++        Example:
++            ```python
++            dt.alter.enable_row_tracking()
++            tracked = dt.to_pyarrow_table(
++                columns=["id"], engine="datafusion", include_row_tracking=True
++            )
++            ```
+         """
++        if not isinstance(include_row_tracking, bool):
++            raise TypeError("include_row_tracking must be a bool")
+         match engine:
+             case "datafusion":
+                 return self._to_pyarrow_table_datafusion(
+@@ -1471,8 +1494,13 @@ class DeltaTable:
+                     columns=columns,
+                     filesystem=filesystem,
+                     filters=filters,
++                    include_row_tracking=include_row_tracking,
+                 )
+             case "pyarrow":
++                if include_row_tracking:
++                    raise ValueError(
++                        'include_row_tracking requires engine="datafusion"'
++                    )
+                 _warn_pyarrow_engine("to_pyarrow_table")
+                 return self._to_pyarrow_table_pyarrow(
+                     partitions=partitions,
+@@ -1522,6 +1550,7 @@ class DeltaTable:
+         columns: list[str] | None,
+         filesystem: str | pa_fs.FileSystem | None,
+         filters: str | FilterType | Expression | None,
++        include_row_tracking: bool = False,
+     ) -> "pyarrow.Table":
+         if partitions is not None:
+             raise ValueError(
+@@ -1552,12 +1581,19 @@ class DeltaTable:
+                 'pyarrow expressions require engine="pyarrow"'
+             )
+ 
+-        reader = self._table.scan(columns=columns, predicate=predicate)
++        reader = self._table.scan(
++            columns=columns,
++            predicate=predicate,
++            include_row_tracking=include_row_tracking,
++        )
+         table = pyarrow.RecordBatchReader.from_stream(reader).read_all()
+         # the engine emits arrow view types; cast back to the table's logical schema
+         target = pyarrow.schema(self.schema().to_arrow())
+         if columns is not None:
+             target = pyarrow.schema([target.field(name) for name in columns])
++        if include_row_tracking:
++            for name in ("__delta_row_id", "__delta_row_commit_version"):
++                target = target.append(table.schema.field(name))
+         return table.cast(target)
+ 
+     def to_pandas(
+@@ -2397,6 +2433,57 @@ class TableAlterer:
+     def __init__(self, table: DeltaTable) -> None:
+         self.table = table
+ 
++    def enable_row_tracking(
++        self,
++        *,
++        commit_properties: CommitProperties | None = None,
++        post_commithook_properties: PostCommitHookProperties | None = None,
++    ) -> None:
++        """Enable stable row IDs and row commit versions on this table.
++
++        Backfills existing files without rewriting their data and upgrades the
++        writer protocol and required features. On success, this DeltaTable
++        handle immediately reflects the committed snapshot. Enabling an
++        already enabled valid table leaves its version unchanged.
++
++        Args:
++            commit_properties: Transaction metadata and retry settings.
++            post_commithook_properties: Checkpoint and log cleanup settings.
++
++        Raises:
++            TypeError: If the properties have the wrong Python types.
++            DeltaProtocolError: For native InvalidData errors, including
++                reserved user-column names, corrupt metadata and ID overflow.
++            CommitFailedError: For native transaction conflicts or exhausted
++                commit retries.
++            DeltaError: For other unsupported native states. Storage errors
++                retain their existing FileNotFoundError/OSError mapping.
++
++        Example:
++            ```python
++            dt.alter.enable_row_tracking()
++            tracked = dt.to_pyarrow_table(
++                engine="datafusion", include_row_tracking=True
++            )
++            ```
++        """
++        from deltalake.transaction import CommitProperties, PostCommitHookProperties
++
++        if commit_properties is not None and not isinstance(
++            commit_properties, CommitProperties
++        ):
++            raise TypeError("commit_properties must be CommitProperties or None")
++        if post_commithook_properties is not None and not isinstance(
++            post_commithook_properties, PostCommitHookProperties
++        ):
++            raise TypeError(
++                "post_commithook_properties must be PostCommitHookProperties or None"
++            )
++        self.table._table.enable_row_tracking(
++            commit_properties=commit_properties,
++            post_commithook_properties=post_commithook_properties,
++        )
++
+     def add_feature(
+         self,
+         feature: TableFeatures | list[TableFeatures],
+diff --git a/python/src/lib.rs b/python/src/lib.rs
+index b22fd36..336f517 100644
+--- a/python/src/lib.rs
++++ b/python/src/lib.rs
+@@ -22,8 +22,13 @@ use deltalake::arrow::{
+ };
+ use deltalake::checkpoints::{cleanup_metadata, create_checkpoint};
+ use deltalake::datafusion::catalog::TableProvider;
++use deltalake::datafusion::catalog::streaming::StreamingTable;
+ use deltalake::datafusion::datasource::provider_as_source;
++use deltalake::datafusion::error::DataFusionError;
++use deltalake::datafusion::execution::{SendableRecordBatchStream, TaskContext};
+ use deltalake::datafusion::logical_expr::LogicalPlanBuilder;
++use deltalake::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
++use deltalake::datafusion::physical_plan::streaming::PartitionStream;
+ use deltalake::datafusion::prelude::SessionContext;
+ use deltalake::delta_datafusion::engine::AsObjectStoreUrl;
+ use deltalake::delta_datafusion::{
+@@ -142,6 +147,46 @@ struct RawDeltaTable {
+     _config: FsConfig,
+ }
+ 
++/// Expose the native tracked scan to DataFusion without buffering its batches.
++/// Filtering and projection must run after native physical-row reconstruction.
++struct RowTrackingPartition {
++    schema: SchemaRef,
++    stream: Mutex<Option<SendableRecordBatchStream>>,
++}
++
++impl std::fmt::Debug for RowTrackingPartition {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("RowTrackingPartition")
++            .field("schema", &self.schema)
++            .finish_non_exhaustive()
++    }
++}
++
++impl PartitionStream for RowTrackingPartition {
++    fn schema(&self) -> &SchemaRef {
++        &self.schema
++    }
++
++    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
++        let stream = self
++            .stream
++            .lock()
++            .map_err(|err| DataFusionError::Execution(err.to_string()))
++            .and_then(|mut stream| {
++                stream.take().ok_or_else(|| {
++                    DataFusionError::Execution("row tracking stream already consumed".into())
++                })
++            });
++        match stream {
++            Ok(stream) => stream,
++            Err(err) => Box::pin(RecordBatchStreamAdapter::new(
++                self.schema.clone(),
++                futures::stream::once(async move { Err(err) }),
++            )),
++        }
++    }
++}
++
+ type CommitInfo = deltalake::kernel::models::CommitInfo;
+ 
+ /// Iterator over a table's commit infos, newest first, yielded as JSON strings.
+@@ -1216,15 +1261,16 @@ impl RawDeltaTable {
+         })
+     }
+ 
+-    #[pyo3(signature = (columns=None, predicate=None))]
++    #[pyo3(signature = (columns=None, predicate=None, *, include_row_tracking=false))]
+     pub fn scan(
+         &self,
+         py: Python,
+         columns: Option<Vec<String>>,
+         predicate: Option<String>,
++        include_row_tracking: bool,
+     ) -> PyResult<Arro3RecordBatchReader> {
+-        let snapshot = self.cloned_state()?;
+-        let log_store = self.log_store()?;
++        let (table, snapshot) = self.cloned_table_and_state()?;
++        let log_store = table.log_store();
+ 
+         py.detach(|| {
+             // Same session setup as PyQueryBuilder::register: a Delta-tuned context
+@@ -1232,10 +1278,31 @@ impl RawDeltaTable {
+             let ctx = DeltaSessionContext::new().into_inner();
+             ctx.register_object_store(log_store.root_url(), log_store.root_object_store());
+ 
+-            let config = DeltaScanConfig::new().with_wrap_partition_values(false);
+-            let provider =
++            let provider: Arc<dyn TableProvider> = if include_row_tracking {
++                if columns.as_ref().is_some_and(|columns| {
++                    columns.iter().any(|name| {
++                        matches!(name.as_str(), "__delta_row_id" | "__delta_row_commit_version")
++                    })
++                }) {
++                    return Err(PyValueError::new_err(
++                        "columns must select user columns; row tracking columns are appended automatically",
++                    ));
++                }
++                let (_, stream) = rt()
++                    .block_on(table.scan_table().with_row_tracking(true).into_future())
++                    .map_err(PythonError::from)?;
++                let schema = stream.schema();
++                let partition = Arc::new(RowTrackingPartition {
++                    schema: schema.clone(),
++                    stream: Mutex::new(Some(stream)),
++                });
++                Arc::new(
++                    StreamingTable::try_new(schema, vec![partition]).map_err(PythonError::from)?,
++                )
++            } else {
++                let config = DeltaScanConfig::new().with_wrap_partition_values(false);
+                 Arc::new(DeltaScanNext::new(snapshot.clone(), config).map_err(PythonError::from)?)
+-                    as Arc<dyn TableProvider>;
++            };
+ 
+             let mut df = ctx.read_table(provider).map_err(PythonError::from)?;
+             if let Some(predicate) = &predicate {
+@@ -1245,7 +1312,10 @@ impl RawDeltaTable {
+                 df = df.filter(expr).map_err(PythonError::from)?;
+             }
+             if let Some(columns) = &columns {
+-                let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
++                let mut columns: Vec<&str> = columns.iter().map(String::as_str).collect();
++                if include_row_tracking {
++                    columns.extend(["__delta_row_id", "__delta_row_commit_version"]);
++                }
+                 df = df.select_columns(&columns).map_err(PythonError::from)?;
+             }
+ 
+@@ -1907,6 +1977,29 @@ impl RawDeltaTable {
+         Ok(serde_json::to_string(&metrics).unwrap())
+     }
+ 
++    #[pyo3(signature = (*, commit_properties=None, post_commithook_properties=None))]
++    pub fn enable_row_tracking(
++        &self,
++        py: Python,
++        commit_properties: Option<PyCommitProperties>,
++        post_commithook_properties: Option<PyPostCommitHookProperties>,
++    ) -> PyResult<()> {
++        let table = py.detach(|| {
++            let table = self._table.lock().map_err(to_rt_err)?.clone();
++            let mut cmd = table.enable_row_tracking();
++            if let Some(commit_properties) =
++                maybe_create_commit_properties(commit_properties, post_commithook_properties)
++            {
++                cmd = cmd.with_commit_properties(commit_properties);
++            }
++            rt().block_on(cmd.into_future())
++                .map_err(PythonError::from)
++                .map_err(PyErr::from)
++        })?;
++        self.set_state(table.state)?;
++        Ok(())
++    }
++
+     #[pyo3(signature = (
+         properties,
+         raise_if_not_exists,
+diff --git a/python/tests/test_row_tracking.py b/python/tests/test_row_tracking.py
+new file mode 100644
+index 0000000..b69cfbd
+--- /dev/null
++++ b/python/tests/test_row_tracking.py
+@@ -0,0 +1,330 @@
++"""Behavioral coverage of enablement and the native tracked read bindings."""
++
++import hashlib
++import json
++import pathlib
++import shutil
++import subprocess
++import sys
++from collections import Counter
++
++import pyarrow as pa
++import pyarrow.compute as pc
++import pytest
++
++from deltalake import CommitProperties, DeltaTable, write_deltalake
++from deltalake.exceptions import DeltaError, DeltaProtocolError
++from deltalake.transaction import PostCommitHookProperties
++
++pytestmark = pytest.mark.pyarrow
++
++ROW_ID = "__delta_row_id"
++ROW_VERSION = "__delta_row_commit_version"
++METADATA = [ROW_ID, ROW_VERSION]
++
++
++@pytest.fixture
++def row_table(tmp_path: pathlib.Path) -> DeltaTable:
++    write_deltalake(
++        tmp_path,
++        pa.table(
++            {
++                "value": pa.array([10, 10, None, 40, 50], type=pa.int64()),
++                "label": ["same", "same", None, "tail", "tail"],
++                "active": [True, True, None, False, True],
++            }
++        ),
++    )
++    return DeltaTable(tmp_path)
++
++
++def tracked(table: DeltaTable, **kwargs) -> pa.Table:
++    return table.to_pyarrow_table(
++        engine="datafusion", include_row_tracking=True, **kwargs
++    )
++
++
++def by_id(table: pa.Table) -> list[dict]:
++    return table.sort_by(ROW_ID).to_pylist()
++
++
++def assert_metadata(table: pa.Table) -> None:
++    assert table.column_names[-2:] == METADATA
++    for name in METADATA:
++        assert table.schema.field(name).type == pa.int64()
++        assert not table.schema.field(name).nullable
++        assert table[name].null_count == 0
++    ids = table[ROW_ID].to_pylist()
++    assert len(set(ids)) == len(ids)
++    assert all(value >= 0 for value in ids)
++
++
++def test_enable_updates_same_handle_without_rewriting_files(row_table, tmp_path):
++    ordinary = row_table.to_pyarrow_table(engine="datafusion")
++    files = {
++        path.relative_to(tmp_path): hashlib.sha256(path.read_bytes()).digest()
++        for path in tmp_path.rglob("*.parquet")
++    }
++    version = row_table.version()
++    assert row_table.alter.enable_row_tracking() is None
++    assert row_table.version() == version + 1
++    assert row_table.metadata().configuration["delta.enableRowTracking"] == "true"
++    assert row_table.protocol().min_writer_version == 7
++    assert {"rowTracking", "domainMetadata"}.issubset(
++        row_table.protocol().writer_features
++    )
++    assert files == {
++        path.relative_to(tmp_path): hashlib.sha256(path.read_bytes()).digest()
++        for path in tmp_path.rglob("*.parquet")
++    }
++    result = tracked(row_table)
++    assert_metadata(result)
++    assert result.column_names == ordinary.column_names + METADATA
++    assert Counter(
++        tuple(row.values()) for row in result.select(ordinary.column_names).to_pylist()
++    ) == Counter(tuple(row.values()) for row in ordinary.to_pylist())
++    assert set(result[ROW_VERSION].to_pylist()) == {row_table.version()}
++    assert by_id(tracked(DeltaTable(tmp_path))) == by_id(result)
++    assert (
++        row_table.to_pyarrow_table(engine="datafusion").column_names
++        == ordinary.column_names
++    )
++
++
++def test_enable_is_idempotent(row_table):
++    row_table.alter.enable_row_tracking()
++    before = tracked(row_table)
++    version = row_table.version()
++    row_table.alter.enable_row_tracking()
++    assert row_table.version() == version
++    assert by_id(tracked(row_table)) == by_id(before)
++
++
++def test_commit_metadata_and_post_commit_hook_are_forwarded(row_table, tmp_path):
++    row_table.alter.set_table_properties({"delta.checkpointInterval": "1"})
++    row_table.alter.enable_row_tracking(
++        commit_properties=CommitProperties(
++            custom_metadata={"trackingTest": {"enabled": True}}, max_commit_retries=0
++        ),
++        post_commithook_properties=PostCommitHookProperties(
++            create_checkpoint=False, cleanup_expired_logs=False
++        ),
++    )
++    log = tmp_path / "_delta_log" / f"{row_table.version():020}.json"
++    actions = [json.loads(line) for line in log.read_text().splitlines()]
++    commit = next(action["commitInfo"] for action in actions if "commitInfo" in action)
++    assert commit["trackingTest"] == {"enabled": True}
++    assert not log.with_suffix(".checkpoint.parquet").exists()
++
++
++@pytest.mark.parametrize("columns", [None, ["label", "value"], [], ["active"]])
++@pytest.mark.parametrize(
++    "filters",
++    [None, "value >= 40", [("value", ">=", 40)], [("value", "=", None)], "FALSE"],
++)
++def test_projection_filters_and_empty_results_preserve_native_metadata(
++    row_table, columns, filters
++):
++    row_table.alter.enable_row_tracking()
++    complete = tracked(row_table)
++    if filters is None:
++        expected = complete
++    elif filters == "FALSE":
++        expected = complete.slice(0, 0)
++    elif filters == [("value", "=", None)]:
++        expected = complete.filter(pc.is_null(complete["value"]))
++    else:
++        expected = complete.filter(pc.greater_equal(complete["value"], 40))
++    selected = complete.column_names[:-2] if columns is None else columns
++    result = tracked(row_table, columns=columns, filters=filters)
++    assert_metadata(result)
++    assert result.column_names == selected + METADATA
++    assert by_id(result) == by_id(expected.select(selected + METADATA))
++
++
++def test_raw_native_binding_agrees_with_public_read(row_table):
++    row_table.alter.enable_row_tracking()
++    native = pa.RecordBatchReader.from_stream(
++        row_table._table.scan(
++            columns=["label"], predicate="value >= 40", include_row_tracking=True
++        )
++    ).read_all()
++    public = tracked(row_table, columns=["label"], filters="value >= 40")
++    assert_metadata(native)
++    assert by_id(native) == by_id(public)
++
++
++def test_unenabled_tracking_fails_and_ordinary_reads_remain_usable(row_table):
++    version = row_table.version()
++    with pytest.raises(DeltaError):
++        tracked(row_table)
++    with pytest.raises(DeltaError):
++        row_table._table.scan(include_row_tracking=True)
++    assert row_table.version() == version
++    assert row_table.to_pyarrow_table(engine="datafusion").num_rows == 5
++
++
++@pytest.mark.parametrize("engine", ["pyarrow", "unknown"])
++def test_tracking_requires_supported_engine(row_table, engine):
++    with pytest.raises(ValueError):
++        row_table.to_pyarrow_table(engine=engine, include_row_tracking=True)
++
++
++@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
++def test_include_row_tracking_requires_bool(row_table, value):
++    with pytest.raises(TypeError, match="include_row_tracking"):
++        row_table.to_pyarrow_table(engine="datafusion", include_row_tracking=value)
++
++
++def test_new_options_are_keyword_only(row_table):
++    with pytest.raises(TypeError):
++        row_table.alter.enable_row_tracking(None)
++    with pytest.raises(TypeError):
++        row_table.to_pyarrow_table(None, None, None, None, "datafusion", True)
++
++
++@pytest.mark.parametrize("option", ["commit_properties", "post_commithook_properties"])
++def test_enable_rejects_invalid_properties_without_committing(row_table, option):
++    version = row_table.version()
++    with pytest.raises(TypeError, match=option):
++        row_table.alter.enable_row_tracking(**{option: {}})
++    assert row_table.version() == version
++    assert DeltaTable(row_table.table_uri).version() == version
++
++
++@pytest.mark.parametrize("name", METADATA)
++def test_reserved_user_columns_reject_enablement_without_committing(tmp_path, name):
++    write_deltalake(tmp_path, pa.table({name: pa.array([1, 2], type=pa.int64())}))
++    table = DeltaTable(tmp_path)
++    version = table.version()
++    with pytest.raises(DeltaProtocolError):
++        table.alter.enable_row_tracking()
++    assert table.version() == version
++    assert DeltaTable(tmp_path).version() == version
++    assert table.to_pyarrow_table(engine="datafusion")[name].to_pylist() == [1, 2]
++
++
++@pytest.mark.parametrize("name", METADATA)
++def test_metadata_is_not_a_user_projection(row_table, name):
++    row_table.alter.enable_row_tracking()
++    with pytest.raises(ValueError, match="user columns"):
++        tracked(row_table, columns=[name])
++
++
++def test_empty_enablement_and_creation_configuration(tmp_path):
++    schema = pa.schema([pa.field("value", pa.int64())])
++    empty = DeltaTable.create(tmp_path / "empty", schema=schema)
++    empty.alter.enable_row_tracking()
++    result = tracked(empty)
++    assert_metadata(result)
++    assert result.num_rows == 0
++    created_path = tmp_path / "configured"
++    write_deltalake(
++        created_path,
++        pa.table({"value": pa.array([1, 1], type=pa.int64())}),
++        configuration={"delta.enableRowTracking": "true"},
++    )
++    created = DeltaTable(created_path)
++    result = tracked(created)
++    assert_metadata(result)
++    assert result.num_rows == 2
++    assert set(result[ROW_VERSION].to_pylist()) == {created.version()}
++
++
++def test_update_append_and_historical_snapshot(row_table):
++    row_table.alter.enable_row_tracking()
++    original = tracked(row_table)
++    enabled_version = row_table.version()
++    row_table.update(updates={"value": "value"}, predicate="value = 10")
++    updated = tracked(row_table)
++    before = {row[ROW_ID]: row for row in original.to_pylist()}
++    for row in updated.to_pylist():
++        old = before[row[ROW_ID]]
++        assert row["value"] == old["value"]
++        assert row[ROW_VERSION] == (
++            row_table.version() if old["value"] == 10 else old[ROW_VERSION]
++        )
++    write_deltalake(
++        row_table,
++        pa.table({"value": [10], "label": ["same"], "active": [True]}),
++        mode="append",
++    )
++    row_table.update_incremental()
++    appended = tracked(row_table)
++    assert_metadata(appended)
++    new_rows = [row for row in appended.to_pylist() if row[ROW_ID] not in before]
++    assert len(new_rows) == 1
++    assert new_rows[0][ROW_VERSION] == row_table.version()
++    assert by_id(
++        appended.filter(pc.is_in(appended[ROW_ID], value_set=updated[ROW_ID]))
++    ) == by_id(updated)
++    historical = DeltaTable(row_table.table_uri, version=enabled_version)
++    assert by_id(tracked(historical)) == by_id(original)
++
++
++def test_checkpoint_copy_and_fresh_process_reopen(row_table, tmp_path):
++    row_table.alter.enable_row_tracking()
++    expected = by_id(tracked(row_table))
++    row_table.create_checkpoint()
++    copied = tmp_path.parent / f"{tmp_path.name}-relocated"
++    shutil.copytree(tmp_path, copied)
++    shutil.rmtree(tmp_path)
++    script = """
++import json
++import sys
++from deltalake import DeltaTable
++table = DeltaTable(sys.argv[1]).to_pyarrow_table(
++    engine="datafusion", include_row_tracking=True
++)
++print(json.dumps(table.sort_by("__delta_row_id").to_pylist()))
++"""
++    process = subprocess.run(
++        [sys.executable, "-c", script, str(copied)],
++        check=True,
++        capture_output=True,
++        text=True,
++        timeout=30,
++    )
++    assert json.loads(process.stdout) == expected
++
++
++@pytest.mark.parametrize(
++    "fixture, column, filters",
++    [
++        (
++            "table_with_column_mapping",
++            "Super Name",
++            [("Company Very Short", "=", "BME")],
++        ),
++        ("table-with-dv-small", "value", [("value", ">=", 4)]),
++    ],
++)
++def test_existing_mapped_and_dv_tables_keep_metadata_aligned(
++    tmp_path, fixture, column, filters
++):
++    source = (
++        pathlib.Path(__file__).parents[2]
++        / "crates"
++        / "test"
++        / "tests"
++        / "data"
++        / fixture
++    )
++    destination = tmp_path / "table"
++    shutil.copytree(source, destination)
++    table = DeltaTable(destination)
++    ordinary = table.to_pyarrow_table(
++        engine="datafusion", columns=[column], filters=filters
++    )
++    table.alter.enable_row_tracking()
++    full = tracked(table)
++    result = tracked(table, columns=[column], filters=filters)
++    assert_metadata(result)
++    assert Counter(result[column].to_pylist()) == Counter(ordinary[column].to_pylist())
++    matching = {
++        row[column]: (row[ROW_ID], row[ROW_VERSION]) for row in full.to_pylist()
++    }
++    assert all(
++        (row[ROW_ID], row[ROW_VERSION]) == matching[row[column]]
++        for row in result.to_pylist()
++    )

@@ -1,0 +1,184 @@
+diff --git a/src/memory_service/core.py b/src/memory_service/core.py
+index 52731ae..74694af 100644
+--- a/src/memory_service/core.py
++++ b/src/memory_service/core.py
+@@ -610,6 +610,15 @@ class MemoryService(
+                 namespace=self._namespace,
+             )
+ 
++        # Auto-update wiki for each batch item if living wiki is initialized
++        if self._wiki_auto_update and self._living_wiki is not None:
++            for item in valid_items:
++                try:
++                    self._living_wiki.update_for_item(item)
++                except Exception:
++                    logger.warning("Wiki update failed during batch_learn()", exc_info=True)
++                    pass  # Wiki update failure should not block batch_learn()
++
+         return result
+ 
+     def recall(
+diff --git a/src/memory_service/wiki_engine.py b/src/memory_service/wiki_engine.py
+index 5d2683e..116a3e5 100644
+--- a/src/memory_service/wiki_engine.py
++++ b/src/memory_service/wiki_engine.py
+@@ -33,6 +33,10 @@ class LivingWikiEngine:
+         self._list_pages_cache: list | None = None
+         self._list_pages_cache_ts: float = 0.0
+ 
++    def _invalidate_list_pages_cache(self) -> None:
++        self._list_pages_cache = None
++        self._list_pages_cache_ts = 0.0
++
+     def _get_db(self):
+         return get_db(self)
+ 
+diff --git a/src/memory_service/wiki_engine_pages.py b/src/memory_service/wiki_engine_pages.py
+index 5c893ee..f8c4132 100644
+--- a/src/memory_service/wiki_engine_pages.py
++++ b/src/memory_service/wiki_engine_pages.py
+@@ -86,8 +86,11 @@ def create_page(engine, entity: str, entity_type: str = "default", content: str
+     slug = engine._safe_slug(entity)
+     page_path = engine._wiki_dir / "pages" / f"{slug}.md"
+ 
+-    existing = db.execute("SELECT name FROM entities WHERE name = ?", (entity,)).fetchone()
+-    if existing is not None:
++    existing = db.execute(
++        "SELECT name FROM entities WHERE name = ? OR page_path = ?",
++        (entity, str(page_path)),
++    ).fetchone()
++    if existing is not None or page_path.exists():
+         db.close()
+         return {"status": "already_exists", "slug": slug, "entity": entity, "path": str(page_path)}
+ 
+@@ -115,6 +118,9 @@ def create_page(engine, entity: str, entity_type: str = "default", content: str
+     engine._log_action(db, "create", entity, f"Manually created {entity_type} page")
+     engine._append_log("create_page", f"Manually created {entity_type} page: {entity}")
+     db.commit()
++    invalidate = getattr(engine, "_invalidate_list_pages_cache", None)
++    if callable(invalidate):
++        invalidate()
+     db.close()
+     return {"status": "created", "slug": slug, "entity": entity, "path": str(page_path)}
+ 
+diff --git a/src/memory_service/wiki_engine_update.py b/src/memory_service/wiki_engine_update.py
+index 4bdacb9..4440a5c 100644
+--- a/src/memory_service/wiki_engine_update.py
++++ b/src/memory_service/wiki_engine_update.py
+@@ -40,15 +40,22 @@ def update(engine, force: bool = False) -> UpdateResult:
+         for ename, etype in entities:
+             row = db.execute("SELECT name FROM entities WHERE name = ?", (ename,)).fetchone()
+             if row is None:
+-                _create_entity_page(engine, db, ename, etype, item.content)
+-                result.pages_created += 1
++                linked_entity = _create_entity_page(engine, db, ename, etype, item.content)
++                if linked_entity is None:
++                    continue
++                if linked_entity == ename:
++                    result.pages_created += 1
++                else:
++                    _append_entity_snippet(engine, db, linked_entity, etype, item.content)
++                    result.pages_updated += 1
+             else:
++                linked_entity = ename
+                 _append_entity_snippet(engine, db, ename, etype, item.content)
+                 result.pages_updated += 1
+ 
+             db.execute(
+                 "INSERT OR IGNORE INTO entity_memories (entity_name, memory_id, snippet, added_at) VALUES (?, ?, ?, ?)",
+-                (ename, item.id, item.content[:100], time.time()),
++                (linked_entity, item.id, item.content[:100], time.time()),
+             )
+ 
+         result.entities_found += len(entities)
+@@ -87,6 +94,9 @@ def update(engine, force: bool = False) -> UpdateResult:
+         f"Created {result.pages_created}, updated {result.pages_updated}, indexed {result.memories_indexed} memories, {result.backlinks_added} backlinks",
+     )
+     db.commit()
++    invalidate = getattr(engine, "_invalidate_list_pages_cache", None)
++    if callable(invalidate):
++        invalidate()
+     db.close()
+     return result
+ 
+@@ -111,16 +121,23 @@ def update_for_item(engine, item: Any) -> UpdateResult:
+         for ename, etype in entities:
+             row = db.execute("SELECT name FROM entities WHERE name = ?", (ename,)).fetchone()
+             if row is None:
+-                _create_entity_page(engine, db, ename, etype, item.content, compounding=True)
+-                result.pages_created += 1
++                linked_entity = _create_entity_page(engine, db, ename, etype, item.content, compounding=True)
++                if linked_entity is None:
++                    continue
++                if linked_entity == ename:
++                    result.pages_created += 1
++                else:
++                    _append_entity_snippet(engine, db, linked_entity, etype, item.content)
++                    result.pages_updated += 1
+             else:
++                linked_entity = ename
+                 _append_entity_snippet(engine, db, ename, etype, item.content)
+                 result.pages_updated += 1
+             db.execute(
+                 "INSERT OR IGNORE INTO entity_memories (entity_name, memory_id, snippet, added_at) VALUES (?, ?, ?, ?)",
+-                (ename, item.id, item.content[:100], time.time()),
++                (linked_entity, item.id, item.content[:100], time.time()),
+             )
+-            entity_names.append(ename)
++            entity_names.append(linked_entity)
+ 
+         result.entities_found += len(entities)
+         for ename in entity_names:
+@@ -132,6 +149,9 @@ def update_for_item(engine, item: Any) -> UpdateResult:
+             "update_for_item",
+             f"Created {result.pages_created}, updated {result.pages_updated}, found {result.entities_found} entities",
+         )
++        invalidate = getattr(engine, "_invalidate_list_pages_cache", None)
++        if callable(invalidate):
++            invalidate()
+     finally:
+         db.close()
+ 
+@@ -196,6 +216,9 @@ def refresh_entity_page(engine, entity: str, trigger: str | None = None, db=None
+         )
+         if own_db:
+             db.commit()
++        invalidate = getattr(engine, "_invalidate_list_pages_cache", None)
++        if callable(invalidate):
++            invalidate()
+     finally:
+         if own_db:
+             db.close()
+@@ -238,15 +261,23 @@ def update_cross_references(engine, entities: List[str], db=None) -> int:
+                                 page_path.write_text(content, encoding="utf-8")
+         if own_db:
+             db.commit()
++        invalidate = getattr(engine, "_invalidate_list_pages_cache", None)
++        if callable(invalidate):
++            invalidate()
+     finally:
+         if own_db:
+             db.close()
+     return added
+ 
+ 
+-def _create_entity_page(engine, db, ename: str, etype: str, content: str, compounding: bool = False) -> None:
++def _create_entity_page(engine, db, ename: str, etype: str, content: str, compounding: bool = False) -> str | None:
+     slug = engine._safe_slug(ename)
+     page_path = engine._wiki_dir / "pages" / f"{slug}.md"
++    existing = db.execute("SELECT name FROM entities WHERE page_path = ?", (str(page_path),)).fetchone()
++    if existing is not None:
++        return existing["name"]
++    if page_path.exists():
++        return None
+     meta = {
+         "entity": ename,
+         "type": etype,
+@@ -265,6 +296,7 @@ def _create_entity_page(engine, db, ename: str, etype: str, content: str, compou
+     )
+     detail = f"New {etype} page (compounding)" if compounding else f"New {etype} page"
+     engine._log_action(db, "create", ename, detail)
++    return ename
+ 
+ 
+ def _append_entity_snippet(engine, db, ename: str, etype: str, content: str) -> None:

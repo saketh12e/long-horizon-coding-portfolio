@@ -1,0 +1,553 @@
+diff --git a/tests/test_team_scoped_hiring.py b/tests/test_team_scoped_hiring.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_team_scoped_hiring.py
+@@ -0,0 +1,548 @@
++"""Behavioral regression tests for team-scoped hiring workflow."""
++
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++_TEST_FILE = Path(__file__).resolve()
++REPO_ROOT = None
++for _candidate in (
++    Path.cwd().resolve(),
++    Path("/app/simulation"),
++    Path("/workspace"),
++    *_TEST_FILE.parents,
++):
++    if (_candidate / "managers" / "gmManager.py").exists() and (
++        _candidate / "managers" / "teamManager.py"
++    ).exists():
++        REPO_ROOT = _candidate
++        break
++if REPO_ROOT is None:
++    REPO_ROOT = Path.cwd().resolve()
++
++os.environ.setdefault("LOG_TO_FILE", "0")
++os.environ.setdefault("TIMING_MODE", "fast")
++
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
++
++def _api_main():
++    os.environ.setdefault("DATABASE_DIR", "/tmp/gm-coach-verifier")
++    import api.main as main_mod
++
++    return main_mod
++
++
++def _reload_database_for_dir(db_dir: Path):
++    import importlib
++
++    os.environ["DATABASE_DIR"] = str(db_dir)
++    import database.connection as conn
++
++    if conn.engine is not None:
++        conn.engine.dispose()
++    importlib.reload(conn)
++    return conn
++
++
++def _fake_team(team_id: int, name: str, tier: str = "MID_MARKET"):
++    return SimpleNamespace(
++        id=team_id,
++        name=name,
++        fundingTier=tier,
++        coach_id=None,
++        coach=None,
++    )
++
++
++def _fake_vote(target_id: int, count: int = 1):
++    return SimpleNamespace(target_player_id=target_id, votes=count)
++
++
++class _VoteRepoStub:
++    def __init__(self, votes_by_team: dict[int, list]):
++        self._votes = votes_by_team
++
++    def getVotesForTeam(self, team_id: int, season: int, vote_type: str):
++        if vote_type != "hire_coach":
++            return []
++        return self._votes.get(team_id, [])
++
++    def getTeamFanCount(self, team_id: int, season: int) -> int:
++        return 10
++
++    def recordResult(self, **kwargs):
++        return None
++
++
++@pytest.fixture()
++def coach_hire_db(tmp_path):
++    db_dir = tmp_path / "db"
++    db_dir.mkdir(parents=True, exist_ok=True)
++    _reload_database_for_dir(db_dir)
++
++    from database import clear_database, init_db
++    from database.connection import get_session
++    from database.models import Team
++
++    init_db()
++    clear_database()
++
++    session = get_session()
++    try:
++        session.add(
++            Team(
++                id=1,
++                name="Harbor Hawks",
++                city="Harbor",
++                abbr="HK1",
++                color="#111111",
++                offense_rating=80,
++                defense_rating=80,
++                overall_rating=80,
++            )
++        )
++        session.add(
++            Team(
++                id=2,
++                name="Bay Brawlers",
++                city="Bay",
++                abbr="BB2",
++                color="#222222",
++                offense_rating=75,
++                defense_rating=75,
++                overall_rating=75,
++            )
++        )
++        session.commit()
++    finally:
++        session.close()
++
++    names = [f"CoachName{i}" for i in range(200)]
++    player_mgr = SimpleNamespace(
++        unusedNames=list(names),
++        saveUnusedNames=lambda: None,
++        popUniqueName=lambda: names.pop(0) if names else "Generated Coach",
++    )
++
++    from service_container import ServiceContainer
++
++    sc = ServiceContainer()
++    sc.registerService("player_manager", player_mgr)
++
++    from managers.teamManager import TeamManager
++
++    tm = TeamManager(sc)
++    yield {
++        "session_factory": get_session,
++        "team_manager": tm,
++        "teams": [_fake_team(1, "Harbor Hawks", "SMALL_MARKET"), _fake_team(2, "Bay Brawlers", "MEGA_MARKET")],
++        "season": 9,
++    }
++
++
++def _gm_with_votes(votes_by_team: dict[int, list]):
++    from managers.gmManager import GmManager
++
++    session = votes_by_team.get("_session")
++    gm = GmManager(session)
++    gm.voteRepo = _VoteRepoStub({k: v for k, v in votes_by_team.items() if k != "_session"})
++    return gm
++
++
++def _import_coach_candidate_model():
++    try:
++        from database.models import CoachCandidate
++    except ImportError:
++        pytest.fail("Per-team hire slates need persisted coach-candidate rows")
++    return CoachCandidate
++
++
++def _generate_team_hire_slate(tm, team, season, session):
++    try:
++        return tm.generateCoachCandidates(team, season, session=session)
++    except AttributeError:
++        pytest.fail("Team manager cannot generate the per-team three-coach hire slate")
++
++
++def _clear_team_hire_slate(tm, team_id, season, session, *, keep_coach_id):
++    try:
++        return tm.clearCoachCandidates(
++            team_id, season, keepCoachId=keep_coach_id, session=session
++        )
++    except AttributeError:
++        pytest.fail("Team manager cannot clear a resolved per-team hire slate")
++
++
++class TestCoachCandidatePersistence:
++    def test_coach_candidates_persist_for_team_and_season(self, coach_hire_db):
++        from sqlalchemy import inspect
++
++        CoachCandidate = _import_coach_candidate_model()
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            rows = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.commit()
++            table_names = inspect(session.bind).get_table_names()
++            count = (
++                session.query(CoachCandidate)
++                .filter_by(team_id=team.id, season=season)
++                .count()
++            )
++        finally:
++            session.close()
++
++        assert "coach_candidates" in table_names
++        assert len(rows) == 3
++        assert count == 3
++
++    def test_generate_coach_candidates_creates_three_rows(self, coach_hire_db):
++        CoachCandidate = _import_coach_candidate_model()
++        data = coach_hire_db
++        tm = data["team_manager"]
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            rows = _generate_team_hire_slate(tm, team, season, session=session)
++            ratings = sorted(c.coach.overall_rating for c in rows)
++            session.commit()
++            count = (
++                session.query(CoachCandidate)
++                .filter_by(team_id=team.id, season=season)
++                .count()
++            )
++        finally:
++            session.close()
++
++        assert len(rows) == 3
++        assert count == 3
++        assert ratings[-1] >= ratings[0]
++
++    def test_generate_coach_candidates_idempotent(self, coach_hire_db):
++        _import_coach_candidate_model()
++        data = coach_hire_db
++        tm = data["team_manager"]
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            first = _generate_team_hire_slate(tm, team, season, session=session)
++            first_ids = [c.coach_id for c in first]
++            second = _generate_team_hire_slate(tm, team, season, session=session)
++            second_ids = [c.coach_id for c in second]
++            session.commit()
++        finally:
++            session.close()
++
++        assert len(first) == 3
++        assert first_ids == second_ids
++
++    def test_three_coach_slate_has_premium_to_developmental_spread(
++        self, coach_hire_db, monkeypatch
++    ):
++        import random
++
++        import numpy as np
++
++        monkeypatch.setattr(random, "shuffle", lambda items: None)
++        monkeypatch.setattr(
++            np.random,
++            "normal",
++            lambda loc, scale, size=None: (
++                np.array(loc) if size is None else np.full(size, loc)
++            ),
++        )
++
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            rows = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            ratings = sorted(c.coach.overall_rating for c in rows)
++        finally:
++            session.close()
++
++        assert len(ratings) == 3
++        assert ratings == [72, 80, 90]
++
++
++class TestPerTeamHireResolution:
++    def test_resolve_hire_uses_plurality_within_team_slate(self, coach_hire_db):
++        CoachCandidate = _import_coach_candidate_model()
++        from database.models import Coach as DBCoach
++
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            cands = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.flush()
++            winner = cands[1]
++            gm = _gm_with_votes({1: [_fake_vote(winner.coach_id, 5)], "_session": session})
++            gm.resolveHireCoachVotes(
++                data["teams"], season, data["team_manager"], {team.id}
++            )
++            session.flush()
++            hired_id = session.query(DBCoach).filter_by(team_id=team.id).first().id
++            remaining = (
++                session.query(CoachCandidate)
++                .filter_by(team_id=team.id, season=season)
++                .count()
++            )
++        finally:
++            session.close()
++
++        assert hired_id == winner.coach_id
++        assert remaining == 0
++
++    def test_resolve_ignores_votes_outside_team_slate(self, coach_hire_db):
++        _import_coach_candidate_model()
++        from database.models import Coach as DBCoach
++
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            cands = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.flush()
++            outsider = 999_001
++            default_pick = sorted(
++                cands, key=lambda c: (-c.coach.overall_rating, c.coach_id)
++            )[0]
++            gm = _gm_with_votes({1: [_fake_vote(outsider, 99)], "_session": session})
++            gm.resolveHireCoachVotes(
++                data["teams"], season, data["team_manager"], {team.id}
++            )
++            session.flush()
++            hired = session.query(DBCoach).filter_by(team_id=team.id).first()
++        finally:
++            session.close()
++
++        assert hired.id == default_pick.coach_id
++
++    def test_resolve_no_votes_defaults_to_highest_rated_candidate(self, coach_hire_db):
++        _import_coach_candidate_model()
++        from database.models import Coach as DBCoach
++
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            cands = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.flush()
++            expected = sorted(
++                cands, key=lambda c: (-c.coach.overall_rating, c.coach_id)
++            )[0]
++            gm = _gm_with_votes({1: [], "_session": session})
++            gm.resolveHireCoachVotes(
++                data["teams"], season, data["team_manager"], {team.id}
++            )
++            session.flush()
++            hired = session.query(DBCoach).filter_by(team_id=team.id).first()
++        finally:
++            session.close()
++
++        assert hired.id == expected.coach_id
++
++    def test_cross_team_hires_use_isolated_slates_not_shared_pool(self, coach_hire_db):
++        _import_coach_candidate_model()
++        from database.models import Coach as DBCoach
++
++        data = coach_hire_db
++        season = data["season"]
++        small, mega = data["teams"]
++        session = data["session_factory"]()
++        try:
++            small_cands = _generate_team_hire_slate(
++                data["team_manager"], small, season, session=session
++            )
++            mega_cands = _generate_team_hire_slate(
++                data["team_manager"], mega, season, session=session
++            )
++            session.flush()
++            small_pick = small_cands[0]
++            mega_pick = mega_cands[0]
++            gm = _gm_with_votes(
++                {
++                    small.id: [_fake_vote(small_pick.coach_id, 3)],
++                    mega.id: [_fake_vote(mega_pick.coach_id, 3)],
++                    "_session": session,
++                }
++            )
++            gm.resolveHireCoachVotes(
++                data["teams"],
++                season,
++                data["team_manager"],
++                {small.id, mega.id},
++            )
++            session.commit()
++            small_hired = (
++                session.query(DBCoach).filter_by(team_id=small.id).one().id
++            )
++            mega_hired = session.query(DBCoach).filter_by(team_id=mega.id).one().id
++        finally:
++            session.close()
++
++        assert small_hired == small_pick.coach_id
++        assert mega_hired == mega_pick.coach_id
++        assert small_hired != mega_hired
++
++    def test_resolver_does_not_use_league_wide_unassigned_pool(self, coach_hire_db, monkeypatch):
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++
++        def _forbidden_global_pool(*_args, **_kwargs):
++            raise AssertionError(
++                "hire_coach resolution must not walk the league-wide unassigned coach pool"
++            )
++
++        monkeypatch.setattr(
++            data["team_manager"], "getAvailableCoaches", _forbidden_global_pool
++        )
++        try:
++            cands = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.flush()
++            gm = _gm_with_votes(
++                {team.id: [_fake_vote(cands[0].coach_id, 2)], "_session": session}
++            )
++            gm.resolveHireCoachVotes(
++                data["teams"], season, data["team_manager"], {team.id}
++            )
++            from database.models import Coach as DBCoach
++
++            session.flush()
++            hired = session.query(DBCoach).filter_by(team_id=team.id).first()
++        finally:
++            session.close()
++
++        assert hired is not None
++        assert hired.id == cands[0].coach_id
++
++    def test_clear_coach_candidates_drops_losers(self, coach_hire_db):
++        CoachCandidate = _import_coach_candidate_model()
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            cands = _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.flush()
++            keeper = cands[0].coach_id
++            removed = _clear_team_hire_slate(
++                data["team_manager"],
++                team.id,
++                season,
++                session,
++                keep_coach_id=keeper,
++            )
++            session.commit()
++            remaining = (
++                session.query(CoachCandidate)
++                .filter_by(team_id=team.id, season=season)
++                .count()
++            )
++        finally:
++            session.close()
++
++        assert removed == 3
++        assert remaining == 0
++
++
++class TestGmEligibleTargetsApi:
++    def test_eligible_targets_exposes_team_scoped_coach_candidates(self, coach_hire_db):
++        _import_coach_candidate_model()
++        main = _api_main()
++
++        data = coach_hire_db
++        team = data["teams"][0]
++        season = data["season"]
++        session = data["session_factory"]()
++        try:
++            _generate_team_hire_slate(
++                data["team_manager"], team, season, session=session
++            )
++            session.commit()
++
++            class _Season:
++                seasonNumber = season
++
++            fake_app = SimpleNamespace(
++                seasonManager=SimpleNamespace(currentSeason=_Season()),
++                serviceContainer=SimpleNamespace(
++                    getService=lambda name: data["team_manager"]
++                    if name == "team_manager"
++                    else None
++                ),
++            )
++            data["team_manager"].teams = [team]
++            monkeypatch_targets = pytest.MonkeyPatch()
++            monkeypatch_targets.setattr(main, "simulation_app", fake_app)
++            monkeypatch_targets.setattr(main, "_getCurrentUser", lambda: SimpleNamespace(id=1))
++
++            resp = main.get_gm_eligible_targets(teamId=team.id, user=SimpleNamespace(id=1))
++            monkeypatch_targets.undo()
++        finally:
++            session.close()
++
++        assert resp["success"] is True
++        payload = resp["data"]
++        assert "coachCandidates" in payload, (
++            "GM eligible targets must return per-team coachCandidates, not a league pool"
++        )
++        assert "availableCoaches" not in payload
++        assert len(payload["coachCandidates"]) == 3
++        assert all(c["id"] for c in payload["coachCandidates"])
++
++
++class TestRegressionGuards:
++    def test_team_manager_still_generates_standalone_coaches(self, coach_hire_db):
++        coach = coach_hire_db["team_manager"].generateCoach(seed=85)
++        assert coach.name
++        assert 60 <= coach.overallRating <= 100
++
++    def test_shared_pool_helper_still_lists_unassigned_coaches(self, coach_hire_db):
++        from database.models import Coach as DBCoach
++
++        data = coach_hire_db
++        session = data["session_factory"]()
++        try:
++            session.add(
++                DBCoach(name="Pool Coach", team_id=None, overall_rating=70)
++            )
++            session.commit()
++            pool = data["team_manager"].getAvailableCoaches()
++        finally:
++            session.close()
++
++        assert len(pool) >= 1

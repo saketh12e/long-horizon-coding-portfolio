@@ -1,0 +1,546 @@
+diff --git a/managers/gmManager.py b/managers/gmManager.py
+index 0dc8536..398119a 100644
+--- a/managers/gmManager.py
++++ b/managers/gmManager.py
+@@ -163,117 +163,136 @@ class GmManager:
+ 
+     def resolveHireCoachVotes(self, teams, season: int,
+                               teamManager, firedTeamIds: set) -> List[Dict]:
+-        """Resolve hire_coach votes for teams that fired their coach.
+-
+-        Hire-coach is deterministic plurality: whichever candidate has the
+-        most votes wins, regardless of total vote count. One vote is enough
+-        if nobody else has more. Ties broken by lowest coach ID for
+-        stability. Only when zero hire votes were cast does the resolver
+-        fall back to an auto-pick (random generated coach).
+-
+-        Resolution order (when multiple teams target the same coach):
+-            1. Market tier — MEGA > LARGE > MID > SMALL
+-            2. Fan count desc as tiebreaker within tier
+-        Higher-priority team gets first dibs; lower-priority teams fall
+-        through to their next-ranked candidate.
+-
+-        For each team in priority order:
+-        - Tally hire_coach votes by candidate
+-        - Pick the leader; if leader is no longer in the pool (e.g. another
+-          team's resolution claimed them this offseason), try the next
+-        - If no votes at all, generate a fallback coach
++        """Resolve hire_coach votes for teams that fired or lost their coach.
++
++        Per-team candidate model (replaces shared coach pool):
++          - Each team has its own 3-coach candidate slate (CoachCandidate
++            rows), generated lazily when the team needs to hire.
++          - Votes target coach IDs within that team's slate.
++          - **Plurality wins, period.** No tier order, no cross-team
++            contention, no fallthrough to other teams' candidates.
++          - Ties broken by lowest coach ID for stability.
++          - If no votes were cast, the highest-rated candidate wins by
++            default (better than auto-pick — the user already saw all
++            candidates and just didn't engage).
++
++        After resolution, the team's losing candidates are deleted and
++        their names returned to the unused-name pool.
+         """
++        from database.models import CoachCandidate
+         results = []
+-        availableCoaches = teamManager.getAvailableCoaches()
+-        coachNames = {c.id: c.name for c in availableCoaches}
+-        availableIds = {c.id for c in availableCoaches}
+-
+-        # Resolution priority: market tier asc (MEGA first), then fan count desc.
+-        _TIER_RANK = {
+-            'MEGA_MARKET': 0,
+-            'LARGE_MARKET': 1,
+-            'MID_MARKET': 2,
+-            'SMALL_MARKET': 3,
+-        }
++
+         firedTeams = [t for t in teams if t.id in firedTeamIds]
+-        firedTeams.sort(key=lambda t: (
+-            _TIER_RANK.get(getattr(t, 'fundingTier', None), 99),
+-            -self.voteRepo.getTeamFanCount(t.id, season),
+-            t.id,  # final stable tiebreaker
+-        ))
++        # Sort by team_id for stable result ordering — priority no longer
++        # matters since each team's candidate slate is isolated.
++        firedTeams.sort(key=lambda t: t.id)
+ 
+         for team in firedTeams:
++            # Pull (or lazily generate) this team's candidate slate.
++            candidates = teamManager.getCoachCandidates(team, season, session=self.session)
++            if not candidates:
++                # No candidates and we couldn't generate any (e.g. empty
++                # name pool) — fall back to the legacy auto-pick path so
++                # the team still gets a coach. deferSave so we don't
++                # contend with the outer write lock; seasonManager
++                # commits the session and saves names once at the end.
++                newCoach = teamManager.generateCoach(deferSave=True)
++                teamManager.hireCoach(team, newCoach, session=self.session)
++                logger.warning(
++                    f"GM: {team.name} auto-hired {newCoach.name} "
++                    f"(no candidates available)"
++                )
++                continue
++
++            candidateById = {c.coach_id: c for c in candidates}
++            candidateIds = set(candidateById.keys())
+ 
+             votes = self.voteRepo.getVotesForTeam(team.id, season, "hire_coach")
+             votesByTarget: Dict[int, int] = {}
+             for v in votes:
+-                if v.target_player_id:
++                # Only count votes targeting this team's own candidates.
++                # Stale votes from before the slate was generated are ignored.
++                if v.target_player_id and v.target_player_id in candidateIds:
+                     votesByTarget[v.target_player_id] = (
+                         votesByTarget.get(v.target_player_id, 0) + 1
+                     )
+ 
+-            leaderVotes = max(votesByTarget.values()) if votesByTarget else 0
+-            leaderCount = sum(1 for v in votesByTarget.values() if v == leaderVotes) if leaderVotes > 0 else 0
+-            hired = False
+-            # Sort by votes desc, then coachId asc for stable tiebreak
+-            ranked = sorted(
+-                votesByTarget.items(), key=lambda x: (-x[1], x[0])
+-            )
+-            for coachId, count in ranked:
+-                coachName = coachNames.get(coachId, f"Coach#{coachId}")
+-                threshold, displayProb = self.hireCoachDisplay(
+-                    count, leaderVotes, leaderCount
++            # Pick winner. With votes: highest plurality wins (ties broken
++            # by lowest coach_id). Without votes: highest-rated candidate
++            # wins by default since the user has already seen them all.
++            if votesByTarget:
++                winnerId = min(
++                    sorted(votesByTarget.items(), key=lambda x: (-x[1], x[0])),
++                    key=lambda x: (-x[1], x[0]),
++                )[0]
++                winnerVotes = votesByTarget[winnerId]
++                reason = "vote_winner"
++            else:
++                # Default: pick highest overall_rating among candidates
++                rankedCands = sorted(
++                    candidates,
++                    key=lambda c: (-c.coach.overall_rating, c.coach_id),
+                 )
+-                isLeader = (count == leaderVotes and not hired)
++                winnerId = rankedCands[0].coach_id
++                winnerVotes = 0
++                reason = "no_votes_default_best"
+ 
+-                if coachId not in availableIds:
+-                    outcome = "ineligible"
+-                elif isLeader:
+-                    if teamManager.hireCoachFromPool(team, coachId, session=self.session):
+-                        outcome = "success"
+-                        availableIds.discard(coachId)
+-                        hired = True
+-                        logger.info(
+-                            f"GM: {team.name} hired {coachName} by vote "
+-                            f"({count} votes, leader of {leaderCount})"
+-                        )
+-                    else:
+-                        outcome = "ineligible"
+-                        logger.warning(
+-                            f"GM: {team.name} leader {coachName} (id={coachId}) "
+-                            f"unavailable in pool — falling through to next"
+-                        )
+-                else:
+-                    outcome = "trailing"
++            winnerCandidate = candidateById[winnerId]
++            winnerName = winnerCandidate.coach.name
+ 
++            # Hire the winning candidate. `hireCoachFromPool` flips
++            # coach.team_id and builds the in-memory Coach on the team.
++            hired = teamManager.hireCoachFromPool(team, winnerId, session=self.session)
++            if not hired:
++                logger.warning(
++                    f"GM: {team.name} winner {winnerName} hire failed — "
++                    f"falling back to auto-generated coach"
++                )
++                newCoach = teamManager.generateCoach(deferSave=True)
++                teamManager.hireCoach(team, newCoach, session=self.session)
++                # Clear the entire slate since none was used. Defer the
++                # name-pool write — the seasonManager driver issues a
++                # single saveUnusedNames after committing this session
++                # so we don't fight the outer write lock per-team.
++                teamManager.clearCoachCandidates(
++                    team.id, season, keepCoachId=None, session=self.session,
++                    deferNameSave=True,
++                )
++                continue
++
++            # Clear the losing candidates: delete rows + return names to pool.
++            # Defer the name-pool save for the same reason as above.
++            teamManager.clearCoachCandidates(
++                team.id, season, keepCoachId=winnerId, session=self.session,
++                deferNameSave=True,
++            )
++
++            logger.info(
++                f"GM: {team.name} hired {winnerName} ({winnerVotes} votes, {reason})"
++            )
++
++            # Record results for the winner and each other candidate so the
++            # offseason recap can show vote totals across the slate.
++            for cand in candidates:
++                coachId = cand.coach_id
++                count = votesByTarget.get(coachId, 0)
++                isWinner = (coachId == winnerId)
++                outcome = "success" if isWinner else "trailing"
+                 self.voteRepo.recordResult(
+                     teamId=team.id, season=season, voteType="hire_coach",
+                     targetPlayerId=coachId, totalVotes=count,
+-                    threshold=threshold, probability=displayProb,
++                    threshold=0, probability=1.0 if isWinner else 0.0,
+                     outcome=outcome,
+                 )
+                 results.append({
+                     "teamId": team.id, "teamName": team.name,
+                     "voteType": "hire_coach",
+-                    "targetPlayerName": coachName,
+-                    "totalVotes": count, "threshold": threshold,
+-                    "probability": displayProb, "outcome": outcome,
++                    "targetPlayerName": cand.coach.name,
++                    "totalVotes": count, "threshold": 0,
++                    "probability": 1.0 if isWinner else 0.0,
++                    "outcome": outcome,
+                 })
+ 
+-            if not hired:
+-                # No votes at all OR every vote target was unavailable — auto-pick.
+-                # Pass session=self.session so the new-coach insert + team
+-                # coach_id FK update share this resolution's connection. Without
+-                # it, _saveCoachToDatabase opens a second connection and
+-                # deadlocks with our session, sitting ~30s on the SQLite write
+-                # lock before failing "database is locked".
+-                newCoach = teamManager.generateCoach()
+-                teamManager.hireCoach(team, newCoach, session=self.session)
+-                reason = "no hire_coach votes" if not votesByTarget else "all candidates unavailable"
+-                logger.info(
+-                    f"GM: {team.name} auto-hired {newCoach.name} ({reason})"
+-                )
+-
+         return results
+ 
+     # ── Re-sign Players ─────────────────────────────────────────────────
+diff --git a/database/models.py b/database/models.py
+index bb6718e..a4edb6d 100644
+--- a/database/models.py
++++ b/database/models.py
+@@ -852,6 +863,36 @@ class UserLoginDay(Base):
+     )
+ 
+ 
++class CoachCandidate(Base):
++    """A coach offered as a candidate to a specific team during a hire cycle.
++
++    Per-team coach hiring (replaces the shared coach pool):
++      - Generated lazily when a team needs a new coach (post-fire or
++        post-retirement) — 3 candidates per vacancy with a quality spread
++        (premium/solid/developmental) so users always have at least one
++        attractive option.
++      - GM hire_coach votes target the coach_id of one of these candidates.
++      - On hire resolution, the winning candidate becomes the team's coach;
++        the other rows are deleted and their coach names returned to the
++        unused-name pool. No cross-team contention.
++    """
++    __tablename__ = "coach_candidates"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    team_id: Mapped[int] = mapped_column(Integer, ForeignKey("teams.id"), nullable=False)
++    coach_id: Mapped[int] = mapped_column(Integer, ForeignKey("coaches.id"), nullable=False)
++    season: Mapped[int] = mapped_column(Integer, nullable=False)
++    slot: Mapped[int] = mapped_column(Integer, nullable=False)  # 0..2
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
++
++    team: Mapped["Team"] = relationship("Team")
++    coach: Mapped["Coach"] = relationship("Coach")
++
++    __table_args__ = (
++        Index("idx_coach_candidates_team_season", "team_id", "season"),
++    )
++
++
+ class UnusedName(Base):
+     """Unused names table - stores available names for new players."""
+     __tablename__ = "unused_names"
+diff --git a/managers/teamManager.py b/managers/teamManager.py
+index 83d033f..1257071 100644
+--- a/managers/teamManager.py
++++ b/managers/teamManager.py
+@@ -1226,7 +1227,7 @@ class TeamManager:
+     # Coach management
+     # -------------------------------------------------------------------------
+ 
+-    def generateCoach(self, seed: int = None) -> FloosCoach.Coach:
++    def generateCoach(self, seed: int = None, deferSave: bool = False) -> FloosCoach.Coach:
+         """Create a new Coach with generated attributes and a unique name from the pool.
+ 
+         Prefers playerManager.popUniqueName when available so any name
+@@ -1234,6 +1235,12 @@ class TeamManager:
+         pool rather than handed to the new coach. Defensive against the
+         kind of pollution that produced coach/player and player/player
+         collisions in past seasons.
++
++        deferSave=True skips the per-call saveUnusedNames database write.
++        Caller is responsible for invoking playerMgr.saveUnusedNames()
++        after the batch completes. Used by batch coach-generation paths
++        (e.g. generateCoachCandidates) to avoid 96 separate write-lock
++        acquisitions inside one outer transaction.
+         """
+         coach = FloosCoach.Coach()
+         coach.generateAttributes(seed=seed)
+@@ -1246,7 +1253,7 @@ class TeamManager:
+         name = None
+         if playerMgr and hasattr(playerMgr, 'popUniqueName'):
+             name = playerMgr.popUniqueName()
+-            if name is not None:
++            if name is not None and not deferSave:
+                 playerMgr.saveUnusedNames()
+         else:
+             # Fallback: legacy path against the local pool. Still mutates
+@@ -1255,7 +1262,7 @@ class TeamManager:
+             if pool:
+                 name = _random.choice(pool)
+                 pool.remove(name)
+-                if playerMgr and hasattr(playerMgr, 'saveUnusedNames'):
++                if playerMgr and hasattr(playerMgr, 'saveUnusedNames') and not deferSave:
+                     playerMgr.saveUnusedNames()
+ 
+         if name is not None:
+@@ -1509,6 +1516,158 @@ class TeamManager:
+         from database.models import Coach as DBCoach
+         return self.db_session.query(DBCoach).filter(DBCoach.team_id == None).all()
+ 
++    # ── Per-team Coach Candidates (new hire flow) ────────────────────────────
++
++    # Quality seeds for the 3 generated candidates per vacancy. Each seed
++    # centers a normal(σ=10) distribution clamped to [60, 100] in
++    # Coach.generateAttributes — so a seed of 90 produces a coach with
++    # overall_rating ≈ 87-92, 80 ≈ 77-82, 72 ≈ 68-74. Premium guarantees
++    # the user always has at least one attractive option.
++    COACH_CANDIDATE_SEEDS = (90, 80, 72)
++
++    def generateCoachCandidates(self, team, season: int, session=None) -> list:
++        """Generate 3 candidate coaches for a team's hire vote.
++
++        Each is persisted as an unassigned Coach DB row (team_id=NULL) plus
++        a CoachCandidate join row tying them to this team's hire cycle.
++        Returns the list of CoachCandidate rows.
++
++        Idempotent — if candidates already exist for (team, season), they
++        are returned as-is. Use clearCoachCandidates to force a regen.
++        """
++        from database.models import Coach as DBCoach, CoachCandidate
++        targetSession = session if session is not None else self.db_session
++        if targetSession is None:
++            return []
++
++        existing = (
++            targetSession.query(CoachCandidate)
++            .filter(CoachCandidate.team_id == team.id, CoachCandidate.season == season)
++            .order_by(CoachCandidate.slot.asc())
++            .all()
++        )
++        if existing:
++            return existing
++
++        # Generate the 3 coaches with quality seeds. Shuffle slot order so
++        # the premium isn't always slot 0 in the UI.
++        seeds = list(self.COACH_CANDIDATE_SEEDS)
++        _random.shuffle(seeds)
++
++        candidates = []
++        for slot, seed in enumerate(seeds):
++            # deferSave=True: skip the per-call saveUnusedNames DB write so
++            # the outer batch transaction isn't fighting another session
++            # for SQLite's write lock 3 times per team × 32 teams. Names
++            # mutate self.unusedNames in memory; we flush once after the
++            # loop via the playerMgr.saveUnusedNames() call below.
++            coach = self.generateCoach(seed=seed, deferSave=True)
++            # Persist as unassigned Coach row
++            dbCoach = DBCoach(
++                name=coach.name,
++                team_id=None,
++                seasons_coached=0,
++                offensive_mind=coach.offensiveMind,
++                defensive_mind=coach.defensiveMind,
++                adaptability=coach.adaptability,
++                aggressiveness=coach.aggressiveness,
++                clock_management=coach.clockManagement,
++                player_development=coach.playerDevelopment,
++                scouting=getattr(coach, 'scouting', 80),
++                attitude=getattr(coach, 'attitude', 80),
++                overall_rating=coach.overallRating,
++            )
++            targetSession.add(dbCoach)
++            targetSession.flush()
++            cand = CoachCandidate(
++                team_id=team.id, coach_id=dbCoach.id,
++                season=season, slot=slot,
++            )
++            targetSession.add(cand)
++            candidates.append(cand)
++
++        targetSession.flush()
++        self.logger.info(
++            f"Generated {len(candidates)} coach candidates for {team.name} "
++            f"(ratings: {[c.coach.overall_rating for c in candidates]})"
++        )
++        return candidates
++
++    def getCoachCandidates(self, team, season: int, session=None) -> list:
++        """Read the team's candidate slate for the season (lazy gen if missing)."""
++        from database.models import CoachCandidate
++        targetSession = session if session is not None else self.db_session
++        if targetSession is None:
++            return []
++        rows = (
++            targetSession.query(CoachCandidate)
++            .filter(CoachCandidate.team_id == team.id, CoachCandidate.season == season)
++            .order_by(CoachCandidate.slot.asc())
++            .all()
++        )
++        if not rows:
++            rows = self.generateCoachCandidates(team, season, session=targetSession)
++        return rows
++
++    def clearCoachCandidates(self, teamId: int, season: int,
++                              keepCoachId: int = None, session=None,
++                              deferNameSave: bool = False) -> int:
++        """Remove this team's candidate slate after a hire resolves. Coaches
++        not chosen are deleted entirely and their names returned to the
++        unused-name pool (per design — coach names are scarce).
++
++        keepCoachId: the winning candidate's coach_id; that coach row is
++        preserved (it's now the team's hired coach). Pass None to wipe
++        all candidates (e.g. when retracting a vacancy).
++
++        deferNameSave=True appends the released names to the in-memory
++        pool but skips the database write. Used by batch callers (GM
++        hire resolution) so the per-team saves don't compete with the
++        outer transaction for SQLite's write lock. Caller must invoke
++        playerMgr.saveUnusedNames() once after the outer commit.
++        """
++        from database.models import Coach as DBCoach, CoachCandidate
++        targetSession = session if session is not None else self.db_session
++        if targetSession is None:
++            return 0
++
++        candidates = (
++            targetSession.query(CoachCandidate)
++            .filter(CoachCandidate.team_id == teamId, CoachCandidate.season == season)
++            .all()
++        )
++        if not candidates:
++            return 0
++
++        releasedNames = []
++        for cand in candidates:
++            if keepCoachId is not None and cand.coach_id == keepCoachId:
++                # Winner — leave Coach row alone, just drop the candidate link.
++                targetSession.delete(cand)
++                continue
++            coach = targetSession.get(DBCoach, cand.coach_id)
++            if coach is not None:
++                releasedNames.append(coach.name)
++                targetSession.delete(coach)
++            targetSession.delete(cand)
++        targetSession.flush()
++
++        # Return names to the unused-name pool so they cycle back into use.
++        if releasedNames:
++            try:
++                playerMgr = self.serviceContainer.getService('player_manager')
++                if playerMgr is not None and hasattr(playerMgr, 'unusedNames'):
++                    for nm in releasedNames:
++                        if nm and nm not in playerMgr.unusedNames:
++                            playerMgr.unusedNames.append(nm)
++                    if not deferNameSave and hasattr(playerMgr, 'saveUnusedNames'):
++                        playerMgr.saveUnusedNames()
++            except Exception as e:
++                self.logger.warning(
++                    f"clearCoachCandidates: failed to return names {releasedNames!r}: {e}"
++                )
++        return len(candidates)
++
+     def hireCoachFromPool(self, team: FloosTeam.Team, coachId: int, session=None) -> bool:
+         """Hire a coach from the pool by DB id. Returns True on success.
+ 
+diff --git a/api/main.py b/api/main.py
+index 63fca37..536ece1 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -7986,23 +8219,45 @@ def get_gm_eligible_targets(teamId: int, user: _User = Depends(_getCurrentUser))
+                 "attitude": getattr(c, 'attitude', 80),
+             }
+ 
+-        # Available coaches in pool
+-        availableCoaches = []
+-        coachPool = session.query(Coach).filter(Coach.team_id == None).all()
+-        for c in coachPool:
+-            availableCoaches.append({
+-                "id": c.id,
+-                "name": c.name,
+-                "overallRating": c.overall_rating,
+-                "offensiveMind": c.offensive_mind,
+-                "defensiveMind": c.defensive_mind,
+-                "adaptability": c.adaptability,
+-                "aggressiveness": c.aggressiveness,
+-                "clockManagement": c.clock_management,
+-                "playerDevelopment": c.player_development,
+-                "scouting": getattr(c, 'scouting', 80),
+-                "attitude": getattr(c, 'attitude', 80),
+-            })
++        # Per-team coach candidates (per-team hiring rework).
++        # Candidates are pre-generated for every team at FA window open so
++        # users can vote on them during the same window as the fire vote.
++        # If FA hasn't opened yet (pre-week-22), the read returns whatever
++        # exists — typically empty until the front office opens.
++        from database.models import CoachCandidate
++        coachCandidates = []
++        if team and teamManager is not None and sm and sm.currentSeason:
++            try:
++                cands = (
++                    session.query(CoachCandidate)
++                    .filter(
++                        CoachCandidate.team_id == team.id,
++                        CoachCandidate.season == sm.currentSeason.seasonNumber,
++                    )
++                    .order_by(CoachCandidate.slot.asc())
++                    .all()
++                )
++            except Exception as e:
++                logger.warning(f"Coach candidate fetch failed for team {teamId}: {e}")
++                cands = []
++            for cand in cands:
++                c = cand.coach
++                if c is None:
++                    continue
++                coachCandidates.append({
++                    "id": c.id,
++                    "slot": cand.slot,
++                    "name": c.name,
++                    "overallRating": c.overall_rating,
++                    "offensiveMind": c.offensive_mind,
++                    "defensiveMind": c.defensive_mind,
++                    "adaptability": c.adaptability,
++                    "aggressiveness": c.aggressiveness,
++                    "clockManagement": c.clock_management,
++                    "playerDevelopment": c.player_development,
++                    "scouting": getattr(c, 'scouting', 80),
++                    "attitude": getattr(c, 'attitude', 80),
++                })
+ 
+         # Rostered players (for cut votes — all players eligible)
+         from simulation_player import Position as _Pos
+@@ -8034,7 +8289,7 @@ def get_gm_eligible_targets(teamId: int, user: _User = Depends(_getCurrentUser))
+         return build_success_response({
+             "teamId": teamId,
+             "coach": coachInfo,
+-            "availableCoaches": availableCoaches,
++            "coachCandidates": coachCandidates,
+             "rosteredPlayers": rosteredPlayers,
+             "expiringPlayers": expiringPlayers,
+             "retiringPlayers": retiringPlayers,

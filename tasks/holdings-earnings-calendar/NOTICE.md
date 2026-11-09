@@ -1,0 +1,1 @@
+This sample contains selected implementation changes and regression tests from an existing application, with identifying strings replaced by neutral placeholders. The application baseline is not distributed. Existing public library names and APIs are retained for technical accuracy. The MIT copyright and permission notice is reproduced in LICENSE.
